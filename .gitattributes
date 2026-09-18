@@ -1,0 +1,5 @@
+*.cmd text eol=crlf
+*.vbs text eol=crlf
+*.py text eol=lf
+*.pyw text eol=lf
+*.md text eol=lf

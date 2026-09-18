@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+
+# Runtime diagnostics / outputs
+conversion_error*.txt
+launcher_diagnostics*.txt
+python_environment.json
+*.verify.json
+*-RECOVERED*.ips
+
+# Bundled donor database - keep out of public GitHub
+Donor.ips
+
+# Local project data
+*.mtu
+*.ips
+*.vtc
+
+# Build artifacts
+dist/
+build/
+*.zip
+
+# OS/editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
