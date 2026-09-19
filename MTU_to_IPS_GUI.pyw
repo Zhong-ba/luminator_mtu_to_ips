@@ -537,7 +537,14 @@ class ConverterUI(tk.Tk):
                             pass
                     self._set_busy(False, "Conversion failed. See the log.")
                     hint = ""
-                    if "[DAO_OPEN_FAILED]" in text:
+                    if "[DATABASE_IN_USE]" in text:
+                        hint = (
+                            "\n\nJet/DAO is available, but the database is currently open exclusively. "
+                            "Close Luminator IPS, Access, or another converter using that database, "
+                            "then retry.\n\n"
+                            "Do not delete a Jet lock file while another user or program may still be using it."
+                        )
+                    elif "[DAO_OPEN_FAILED]" in text:
                         hint = (
                             "\n\npywin32 loaded correctly, but Microsoft Jet/DAO could not be opened "
                             "from this Python process. This is usually a 32/64-bit mismatch. "

@@ -387,6 +387,16 @@ def require_windows_dao():
     return pythoncom, Dispatch, VARIANT
 
 
+def is_database_in_use_error(error: object) -> bool:
+    text = str(error).lower()
+    return (
+        "already opened exclusively" in text
+        or "opened exclusively by user" in text
+        or "5003356" in text
+        or "-2146824932" in text
+    )
+
+
 def open_dao(path: Path, exclusive: bool = False):
     pythoncom, Dispatch, VARIANT = require_windows_dao()
     # The GUI performs conversions in a worker thread.  COM must be initialized
@@ -402,10 +412,11 @@ def open_dao(path: Path, exclusive: bool = False):
         except Exception as e:
             errors.append(f"{progid}: {type(e).__name__}: {e}")
     pythoncom.CoUninitialize()
-    if exclusive and any("in use" in error.lower() or "lock" in error.lower() for error in errors):
+    if any(is_database_in_use_error(error) for error in errors):
         raise RuntimeError(
-            "[OUTPUT_IN_USE] The output IPS database is open in Luminator IPS or another Jet/DAO process. "
-            "Close it completely, then retry the conversion.\n"
+            "[DATABASE_IN_USE] Jet/DAO started successfully, but the database is open exclusively "
+            "in Luminator IPS or another Jet/DAO process. Close that program completely, then retry.\n"
+            f"Database: {path}\n"
             + "\n".join(errors)
         )
     bits = struct.calcsize("P") * 8
