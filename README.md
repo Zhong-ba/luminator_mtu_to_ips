@@ -4,7 +4,7 @@ A Windows recovery tool that reconstructs an editable Luminator IPS project (`.i
 
 > **Status:** reverse-engineered, field-tested with Luminator IPS V3.8, and still evolving. Always keep the original MTU and inspect the recovered project in IPS.
 
-## What it recovers
+## What It Recovers
 
 The converter reconstructs the runtime-visible project data contained in an MTU, including:
 
@@ -18,7 +18,7 @@ The converter reconstructs the runtime-visible project data contained in an MTU,
 - expanded Class-C projects: `Route / DestinationTop / DestinationBot / DestinationSide / RouteSide`
 - the original MTU embedded back into `SignSetOutput`
 
-The output database is written through Microsoft Jet/DAO so it can be opened and edited by Luminator IPS. The desktop converter has a determinate progress display for decode, validation, database writing, and post-write verification.
+The output database is written through Microsoft Jet/DAO so it can be opened and edited by Luminator IPS. The converter has a determinate progress display for decode, validation, database writing, and post-write verification.
 
 ## Requirements
 
@@ -29,34 +29,7 @@ The output database is written through Microsoft Jet/DAO so it can be opened and
 
 Double-click `SETUP_AND_RUN.cmd` to start the desktop converter. It probes 32-bit and 64-bit Jet/DAO, selects a compatible Python, installs `pywin32` when needed, verifies that DAO can be opened, and then starts the GUI. Legacy Luminator IPS installations commonly expose 32-bit Jet/DAO; use `SETUP_AND_RUN_32BIT.cmd` only when you need to force the known 32-bit runtime.
 
-## Windows executable release
-
-The supported executable package is a **one-folder** PyInstaller build. This is deliberate: the converter uses `pywin32` to talk to the locally registered Jet/DAO COM server, so a one-file executable cannot make an incompatible or missing DAO installation work.
-
-1. On a Windows packaging machine, install Python with the same architecture as the Jet/DAO runtime on the PCs that will run the converter. Legacy IPS deployments normally require 32-bit Python.
-2. Install build dependencies into that exact Python:
-
-	```bat
-	py -3-32 -m pip install -r requirements.txt -r requirements-dev.txt
-	```
-
-3. Build and smoke-test the release folder:
-
-	```bat
-	py -3-32 scripts\package_release.py --clean --smoke-test
-	```
-
-The executable is written to `dist\Luminator-MTU-to-IPS\Luminator-MTU-to-IPS.exe`. Ship the entire `Luminator-MTU-to-IPS` folder, not the `.exe` alone. Target PCs still need a matching-bit Luminator IPS/Jet/DAO installation.
-
-`Donor.ips` is excluded by default because redistribution may not be permitted. When distribution is authorized, add it explicitly with:
-
-```bat
-py -3-32 scripts\package_release.py --clean --with-donor
-```
-
-Otherwise users can choose a valid donor database in the application.
-
-## Command line
+## Command Line
 
 ```bat
 py build_ips_windows.py input.mtu Donor.ips recovered.ips --name RECOVERED --class-c-profile auto
@@ -89,7 +62,7 @@ The verification report checks database row counts and confirms that `SignSetOut
 
 Preflight parses and validates an MTU without opening DAO or writing an IPS. It reports unsupported message controls, selector problems, invalid sign geometry, and unresolved resource references before conversion begins.
 
-## Recovery boundary
+## Recovery Boundary
 
 An MTU is a compiled runtime representation, not a perfect archival copy of every editor decision. Runtime display content can be recovered much more reliably than source-only organizational metadata.
 
