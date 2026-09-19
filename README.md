@@ -26,11 +26,8 @@ The output database is written through Microsoft Jet/DAO so it can be opened and
 - Microsoft Jet/DAO capable of opening the Luminator donor database
 - Python 3.10+ if running from source
 - `pywin32`
-- Tkinter (normally included with python.org Windows installers)
 
 Double-click `SETUP_AND_RUN.cmd` to start the desktop converter. It probes 32-bit and 64-bit Jet/DAO, selects a compatible Python, installs `pywin32` when needed, verifies that DAO can be opened, and then starts the GUI. Legacy Luminator IPS installations commonly expose 32-bit Jet/DAO; use `SETUP_AND_RUN_32BIT.cmd` only when you need to force the known 32-bit runtime.
-
-The release bundle includes `Donor.ips` beside the converter. The GUI selects it automatically; you may choose another structurally compatible blank donor when required by your IPS installation. The donor is copied to the output path and is never modified.
 
 ## Command line
 
