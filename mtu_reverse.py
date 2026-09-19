@@ -897,6 +897,75 @@ def assign_color_frame_numbers(frames: list[dict]) -> list[dict]:
     return out
 
 
+def collapse_compiler_rgb_placeholders(frames: list[dict]) -> list[dict]:
+    """Restore IPS's RGB placeholder encoding for a literal leading caret.
+
+    IPSComp turns an unsupported leading ``^`` into bright ``R``, ``G`` and
+    ``B`` plane rows, then emits the remaining text on a red-only pass. Those
+    rows are not an authored color zone; preserving them makes a recovered
+    project visibly show RGB text that the source project did not have.
+    """
+    from collections import defaultdict
+
+    grouped = defaultdict(list)
+    for ordinal, row in enumerate(frames):
+        key = (int(row["MsgClassID"]), int(row["MsgCode"]), int(row["LSignID"]))
+        grouped[key].append((ordinal, row))
+
+    replacements = {}
+    consumed = set()
+    for rows in grouped.values():
+        by_color_frame = defaultdict(list)
+        for ordinal, row in rows:
+            color_frame = row.get("ColorFrame")
+            if row.get("ColorMask") and color_frame is not None:
+                by_color_frame[int(color_frame)].append((ordinal, row))
+
+        for color_frame, current in by_color_frame.items():
+            planes = {int(row.get("ColorMask") or 0): (ordinal, row)
+                      for ordinal, row in current}
+            if set(planes) != {1, 2, 4}:
+                continue
+            red_ordinal, red = planes[1]
+            green_ordinal, green = planes[2]
+            blue_ordinal, blue = planes[4]
+            if (red.get("Phrase"), green.get("Phrase"), blue.get("Phrase")) != ("R", "G", "B"):
+                continue
+            if any(int(row.get("ColorIntensity") or 255) != 255 for row in (red, green, blue)):
+                continue
+            if len({(row.get("FontIndex"), row.get("XPos"), row.get("YPos"))
+                    for row in (red, green, blue)}) != 1:
+                continue
+
+            following = by_color_frame.get(color_frame + 1, [])
+            following_planes = {int(row.get("ColorMask") or 0): (ordinal, row)
+                                for ordinal, row in following}
+            if set(following_planes) != {1, 2, 4}:
+                continue
+            next_red_ordinal, next_red = following_planes[1]
+            _, next_green = following_planes[2]
+            _, next_blue = following_planes[4]
+            if not next_red.get("Phrase") or next_green.get("Phrase") or next_blue.get("Phrase"):
+                continue
+
+            restored = dict(next_red)
+            restored.update({
+                "Frame": int(red["Frame"]), "Phrase": "^" + str(next_red["Phrase"]),
+                "ColorMask": None, "ColorIntensity": None,
+            })
+            replacements[red_ordinal] = restored
+            consumed.update({green_ordinal, blue_ordinal, next_red_ordinal,
+                             following_planes[2][0], following_planes[4][0]})
+
+    out = []
+    for ordinal, row in enumerate(frames):
+        if ordinal in replacements:
+            out.append(replacements[ordinal])
+        elif ordinal not in consumed:
+            out.append(row)
+    return out
+
+
 def reconstruct_color_zones(frames: list[dict], sign_tables: dict) -> list[dict]:
     """Rebuild IPS color-text overlays from the MTU's RGB plane passes."""
     dimensions = {
@@ -1143,10 +1212,24 @@ def reconstruct_resource_tables(raw: bytes, mtu: MTU, fheaders: list[dict],
             st = gheaders[idx]["file_offset"]
             en = gheaders[idx + 1]["file_offset"] if idx + 1 < len(gheaders) else mtu.sections[4].offset
             blobs.append((idx, raw[st:en]))
-        # Some sign-specific compiled variants are blank when the source image
-        # cannot/need not be used on that sign. Choose the richest sibling; the
-        # original IPS graphic body survives exactly in the nonblank variants.
-        chosen_idx, body = max(blobs, key=lambda ib: sum(1 for x in ib[1] if x))
+        by_index = dict(blobs)
+        base_idx, base_body = blobs[0]
+        base_width = be16(base_body, 2) if len(base_body) >= 4 else 0
+        color_plane_indexes = members[1:4]
+        has_color_planes = (
+            len(members) == 5 and len(color_plane_indexes) == 3 and
+            all(gheaders[idx]["param1"] == 0 and len(by_index[idx]) >= 4 and
+                be16(by_index[idx], 2) == base_width for idx in color_plane_indexes) and
+            any(any(by_index[idx][4:]) for idx in color_plane_indexes)
+        )
+        # An RGB source graphic is compiled as the base, red, green and blue
+        # planes followed by an empty fallback. Preserve that ordering because
+        # IPS stores the planes in separate Graphics table blob fields. Other
+        # graphics retain the prior richest-variant selection.
+        if has_color_planes:
+            chosen_idx, body = base_idx, base_body
+        else:
+            chosen_idx, body = max(blobs, key=lambda ib: sum(1 for x in ib[1] if x))
         h = gheaders[chosen_idx]
         gid = group + 1
         for idx in members:
@@ -1163,6 +1246,27 @@ def reconstruct_resource_tables(raw: bytes, mtu: MTU, fheaders: list[dict],
             "GraphicHeight": h["param0"], "GraphicWidth": width,
             "GraphicAllowMod": True, "GraphicCType": None,
             "GraphicBlobHex": db_blob.hex(),
+            "RedGraphicBlobHex": (
+                _authoring_blob_header(
+                    f"RECOVERED GRAPHIC {group:02d}", gheaders[color_plane_indexes[0]]["param0"],
+                    gheaders[color_plane_indexes[0]]["param1"],
+                    gheaders[color_plane_indexes[0]]["param2"],
+                    gheaders[color_plane_indexes[0]]["param3"]) + by_index[color_plane_indexes[0]]
+            ).hex() if has_color_planes else None,
+            "GreenGraphicBlobHex": (
+                _authoring_blob_header(
+                    f"RECOVERED GRAPHIC {group:02d}", gheaders[color_plane_indexes[1]]["param0"],
+                    gheaders[color_plane_indexes[1]]["param1"],
+                    gheaders[color_plane_indexes[1]]["param2"],
+                    gheaders[color_plane_indexes[1]]["param3"]) + by_index[color_plane_indexes[1]]
+            ).hex() if has_color_planes else None,
+            "BlueGraphicBlobHex": (
+                _authoring_blob_header(
+                    f"RECOVERED GRAPHIC {group:02d}", gheaders[color_plane_indexes[2]]["param0"],
+                    gheaders[color_plane_indexes[2]]["param1"],
+                    gheaders[color_plane_indexes[2]]["param2"],
+                    gheaders[color_plane_indexes[2]]["param3"]) + by_index[color_plane_indexes[2]]
+            ).hex() if has_color_planes else None,
         })
     return {"Fonts": fonts, "Graphics": graphics,
             "font_index_map": {i: i + 1 for i in range(len(fheaders))},

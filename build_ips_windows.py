@@ -57,6 +57,7 @@ def build_model(mtu_path: Path, class_c_profile: str = "auto") -> dict:
     graphic_metrics = mr.build_graphic_metrics(raw, gheaders, mtu.sections[4].offset)
     runtime_frames = mr.reconstruct_messageframes(banks, font_metrics, sign_tables, graphic_metrics)
     runtime_frames = mr.assign_color_frame_numbers(runtime_frames)
+    runtime_frames = mr.collapse_compiler_rgb_placeholders(runtime_frames)
     color_zones = mr.reconstruct_color_zones(runtime_frames, sign_tables)
     frames = mr.collapse_color_plane_frames(runtime_frames)
     resources = mr.reconstruct_resource_tables(
@@ -125,12 +126,18 @@ def identify_unknown_message_tokens(model: dict, example_limit: int = 5) -> list
     return sorted(catalog.values(), key=lambda entry: (entry["kind"], entry["token"]))
 
 
-def preflight_model(model: dict) -> dict:
+def preflight_model(model: dict, known_font_ids: set[int] | None = None) -> dict:
     """Source-independent parser sanity checks before touching a Jet database."""
     errors=[]; warnings=[]; unresolved=[]; unknown_masks=[]
     unknown_token_catalog = identify_unknown_message_tokens(model)
     segment_count=0; control_count=0
-    for bank in model["banks"].values():
+    message_records=0
+    message_classes = {}
+    for letter, bank in model["banks"].items():
+        records = len(bank.get("records", []))
+        if letter in "ABCDEFGHIJK" and records:
+            message_classes[letter] = records
+        message_records += records
         for rec in bank.get("records",[]):
             for seg in rec.get("segments",[]):
                 segment_count += 1
@@ -155,10 +162,19 @@ def preflight_model(model: dict) -> dict:
         errors.append(f"unknown sign selector masks: {sorted(set(unknown_masks))}")
     if unresolved:
         errors.append(f"unresolved message controls: {dict(defaultdict(int)) if False else sorted(set(unresolved))}")
+    if model["banks"] and not message_records:
+        warnings.append(
+            "MTU contains no compiled message records; no Class A-K messages can be recovered")
 
     lsign_ids={int(r["LSignID"]) for r in model["sign_tables"]["LogicalSigns"]}
     font_ids={int(r["FontID"]) for r in model["resources"]["Fonts"]}
     graph_ids={int(r["GraphicID"]) for r in model["resources"]["Graphics"]}
+    known_font_ids = set(known_font_ids or ()) if known_font_ids is not None else None
+    known_fonts = (len(font_ids & known_font_ids) if known_font_ids is not None else None)
+    colored_graphics = sum(
+        any(graphic.get(key) for key in ("RedGraphicBlobHex", "GreenGraphicBlobHex", "BlueGraphicBlobHex"))
+        for graphic in model["resources"]["Graphics"]
+    )
     for sign in model["sign_tables"]["LogicalSigns"]:
         if int(sign["LSignDotHeight"]) <= 0 or int(sign["LSignDotWidth"]) <= 0:
             errors.append(
@@ -178,7 +194,16 @@ def preflight_model(model: dict) -> dict:
         "message_pairs":len(pairs), "frame_rows":len(model["db_frames"]),
         "sign_frame_groups":len(group_keys), "effect_zones":len(zone_keys),
         "logical_signs":len(lsign_ids), "fonts":len(font_ids), "graphics":len(graph_ids),
-        "segments":segment_count, "controls":control_count,
+        "message_records":message_records, "segments":segment_count, "controls":control_count,
+        "message_classes":message_classes,
+        "font_categories": {
+            "known": known_fonts,
+            "unknown": len(font_ids) - known_fonts if known_fonts is not None else None,
+        },
+        "graphic_categories": {
+            "colored": colored_graphics,
+            "monochrome": len(graph_ids) - colored_graphics,
+        },
         "unknown_selector_masks":sorted(set(unknown_masks)),
         "unresolved_controls":sorted(set(unresolved)),
         "unknown_token_catalog":unknown_token_catalog,
@@ -231,6 +256,19 @@ def class_message_rows(model: dict) -> dict[str, list[dict]]:
         # most descriptive/longest phrase for the class-list summary.
         return "^".join(max(v,key=len) for _,v in sorted(per_frame.items()) if v)
 
+    def class_a_title_summary(rows: list[dict]) -> str:
+        """Reassemble Class-A title fragments from one logical sign's frames."""
+        text_rows = [r for r in rows if r.get("Phrase")]
+        if not text_rows:
+            return ""
+        lsign_id = min(int(r["LSignID"]) for r in text_rows)
+        text_rows = [r for r in text_rows if int(r["LSignID"]) == lsign_id]
+        return "".join(
+            str(r["Phrase"])
+            for r in sorted(text_rows, key=lambda r: (
+                int(r["Frame"]), int(r.get("YPos", 1)), int(r.get("XPos", 1))))
+        )
+
     out = {"ClassAMsgs": [], "ClassBMsgs": [], "ClassCMsgs": []}
     profile=model.get("class_c_profile","expanded")
     cc_by_code = {int(r["MsgCode"]): r for r in mr.reconstruct_class_c_by_profile(frames, model["sign_tables"], profile)}
@@ -238,7 +276,7 @@ def class_message_rows(model: dict) -> dict[str, list[dict]]:
         if cls == 1:
             out["ClassAMsgs"].append({
                 "MsgCode": code, "MsgClassID": 1, "Approved": True,
-                "Title": next((r.get("Phrase", "") for r in rows if r.get("Phrase")), "")[:255], "IDTitle": 1,
+                "Title": class_a_title_summary(rows)[:255], "IDTitle": 1,
                 "Text": "", "IDText": 2,
             })
         elif cls == 2:
@@ -261,6 +299,40 @@ def class_message_rows(model: dict) -> dict[str, list[dict]]:
                 for key in ("Route", "DestinationTop", "DestinationBot", "DestinationSide", "RouteSide"):
                     recovered[key] = str(recovered.get(key, ""))[:255]
             out["ClassCMsgs"].append(recovered)
+    return out
+
+
+def class_message_element_rows(classes: dict[str, list[dict]], profile: str) -> list[dict]:
+    """Normalize authoring fields into the compiler's ClassMsgs element table."""
+    if profile == "legacy":
+        class_c_fields = (("Route", "IDRoute"), ("Destination", "IDDestination"),
+                          ("SmallSide", "IDSmallSide"))
+    else:
+        class_c_fields = (("Route", "IDRoute"), ("DestinationTop", "IDDestinationTop"),
+                          ("DestinationBot", "IDDestinationBot"),
+                          ("DestinationSide", "IDDestinationSide"),
+                          ("RouteSide", "IDRouteSide"))
+    field_map = {
+        "ClassAMsgs": (("Title", "IDTitle"), ("Text", "IDText")),
+        "ClassBMsgs": (("PRText", "IDPRText"), ("PRBot", "IDPRBot"),
+                        ("PRSide", "IDPRSide")),
+        "ClassCMsgs": class_c_fields,
+    }
+    out = []
+    for table, fields in field_map.items():
+        for row in classes.get(table, []):
+            for text_field, id_field in fields:
+                text = str(row.get(text_field) or "")
+                element_id = row.get(id_field)
+                if not text or element_id is None:
+                    continue
+                out.append({
+                    "MsgCode": int(row["MsgCode"]),
+                    "MsgClassID": int(row["MsgClassID"]),
+                    "ElementID": int(element_id),
+                    "ElementText": text,
+                    "Approved": bool(row.get("Approved", True)),
+                })
     return out
 
 
@@ -490,6 +562,9 @@ def prepare_rows(model: dict, project_name: str,
             "GraphicDescription":r["GraphicDescription"], "GraphicHeight":r["GraphicHeight"],
             "GraphicWidth":r["GraphicWidth"], "GraphicAllowMod":r["GraphicAllowMod"],
             "GraphicCType":r["GraphicCType"], "GraphicBlobHex":r["GraphicBlobHex"],
+            "RedGraphicBlobHex":r.get("RedGraphicBlobHex"),
+            "GreenGraphicBlobHex":r.get("GreenGraphicBlobHex"),
+            "BlueGraphicBlobHex":r.get("BlueGraphicBlobHex"),
         })
 
     physical=[]
@@ -723,6 +798,31 @@ def ensure_expanded_class_c_schema(db) -> None:
         raise RuntimeError("Could not expand ClassCMsgs schema: missing " + ", ".join(sorted(missing)))
 
 
+def ensure_class_message_element_key(db) -> None:
+    """Allow one ClassMsgs row for each authoring element of a message."""
+    tdf = db.TableDefs("ClassMsgs")
+    key_fields = ("MsgCode", "MsgClassID", "ElementID")
+    restrictive = []
+    for index in range(tdf.Indexes.Count):
+        idx = tdf.Indexes(index)
+        fields = tuple(str(idx.Fields(field_index).Name) for field_index in range(idx.Fields.Count))
+        if bool(idx.Primary) and fields == key_fields:
+            return
+        if bool(idx.Primary) and fields == key_fields[:2]:
+            restrictive.append(str(idx.Name))
+    for name in restrictive:
+        tdf.Indexes.Delete(name)
+    if restrictive:
+        index = tdf.CreateIndex("PrimaryKey")
+        index.Primary = True
+        index.Unique = True
+        for field_name in key_fields:
+            index.Fields.Append(index.CreateField(field_name))
+        tdf.Indexes.Append(index)
+    else:
+        raise RuntimeError("ClassMsgs primary key does not match a supported donor schema")
+
+
 def adapt_to_donor_schema(db, dep: dict, classes: dict, profile: str) -> None:
     fields=table_fields(db,"ClassCMsgs")
     if profile=="legacy":
@@ -816,6 +916,8 @@ def verify_written_database(db, model: dict) -> dict:
     expected["ClassAMsgs"]=sum(1 for c,_ in pairs if c==1)
     expected["ClassBMsgs"]=sum(1 for c,_ in pairs if c==2)
     expected["ClassCMsgs"]=sum(1 for c,_ in pairs if c==3)
+    expected["ClassMsgs"]=len(class_message_element_rows(
+        class_message_rows(model), model.get("class_c_profile", "expanded")))
     actual={}
     errors=[]
     for table,n in expected.items():
@@ -870,10 +972,12 @@ def build_ips(mtu_path: Path, template_path: Path, out_path: Path, project_name:
     ws=engine.Workspaces(0)
     try:
         classes=class_message_rows(model)
+        class_elements=class_message_element_rows(classes, model["class_c_profile"])
         if model["class_c_profile"]=="legacy":
             ensure_legacy_class_c_schema(db)
         else:
             ensure_expanded_class_c_schema(db)
+        ensure_class_message_element_key(db)
         ws.BeginTrans()
         try:
             # A blank Donor.ips database contains the required resource/schema objects
@@ -881,7 +985,7 @@ def build_ips(mtu_path: Path, template_path: Path, out_path: Path, project_name:
             # structurally compatible donor databases.
             for table in ("MessageFrames","EffectZones","LogicalSignBuild","SignSetBuild",
                           "LogicalSigns","PhysicalSigns","SignSets","SignMsgCodeProperties",
-                          "ClassAMsgs","ClassBMsgs","ClassCMsgs","ClassTemplates","TemplateZones",
+                          "ClassAMsgs","ClassBMsgs","ClassCMsgs","ClassMsgs","ClassTemplates","TemplateZones",
                           "ColorZone"):
                 try:
                     clear_table(db, table)
@@ -902,6 +1006,7 @@ def build_ips(mtu_path: Path, template_path: Path, out_path: Path, project_name:
                 ("MessageFrames", len(model["db_frames"])), ("ColorZone", len(model.get("color_zones", []))),
                 ("SignMsgCodeProperties", len(message_pairs) * len(model["sign_tables"]["LogicalSigns"])),
                 ("Class-C metadata", len(metadata_elements) + len(metadata_columns)),
+                ("ClassMsgs", len(class_elements)),
                 *[(table, len(rows)) for table, rows in classes.items()],
             ]
             total_write_rows = sum(count for _, count in write_counts)
@@ -923,7 +1028,10 @@ def build_ips(mtu_path: Path, template_path: Path, out_path: Path, project_name:
                 pythoncom=pythoncom,VARIANT=VARIANT,row_callback=report_written_row)
             )
             graph_map=append_autonumber_rows(
-                db,"Graphics",base["Graphics"],"GraphicID",blob_fields={"GraphicBlobHex":"Graphic"},
+                db,"Graphics",base["Graphics"],"GraphicID",blob_fields={
+                    "GraphicBlobHex":"Graphic", "RedGraphicBlobHex":"RedGraphic",
+                    "GreenGraphicBlobHex":"GreenGraphic", "BlueGraphicBlobHex":"BlueGraphic",
+                },
                 pythoncom=pythoncom,VARIANT=VARIANT,row_callback=report_written_row)
             p_map=append_autonumber_rows(
                 db,"PhysicalSigns",base["PhysicalSigns"],"PSignID",
@@ -950,6 +1058,7 @@ def build_ips(mtu_path: Path, template_path: Path, out_path: Path, project_name:
                                    pythoncom=pythoncom,VARIANT=VARIANT,row_callback=report_written_row)
             append_autonumber_rows(db,"SignMsgCodeProperties",dep["SignMsgCodeProperties"],"ID",
                                    pythoncom=pythoncom,VARIANT=VARIANT,row_callback=report_written_row)
+            append_rows(db,"ClassMsgs",class_elements,pythoncom=pythoncom,VARIANT=VARIANT,row_callback=report_written_row)
             for table,rows in classes.items():
                 append_rows(db,table,rows,pythoncom=pythoncom,VARIANT=VARIANT,row_callback=report_written_row)
             ws.CommitTrans()

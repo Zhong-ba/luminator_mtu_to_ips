@@ -404,6 +404,8 @@ class ConverterUI(tk.Tk):
             return
 
         profile_key = self._profile_key()
+        donor_text = self.donor_var.get().strip()
+        donor = Path(donor_text) if donor_text and Path(donor_text).is_file() else None
 
         def work():
             try:
@@ -411,11 +413,20 @@ class ConverterUI(tk.Tk):
                 self.events.put(("progress", (15, "Reading and decoding MTU...")))
                 model = builder.build_model(mtu, profile_key)
                 self.events.put(("progress", (75, "Validating recovered model...")))
-                report = builder.preflight_model(model)
-                cc = mr.reconstruct_class_c_by_profile(
-                    model["frames"], model["sign_tables"], model["class_c_profile"]
-                )
-                report["class_c_rows"] = len(cc)
+                known_font_ids = None
+                if donor is not None:
+                    try:
+                        pythoncom, _, _, db = builder.open_dao(donor)
+                        try:
+                            known_font_ids, _ = builder.donor_font_bindings(
+                                db, model["resources"]["Fonts"])
+                        finally:
+                            db.Close()
+                            pythoncom.CoUninitialize()
+                    except Exception as error:
+                        self.events.put(("log", f"Font comparison unavailable: {error}"))
+                report = builder.preflight_model(
+                    model, set(known_font_ids) if known_font_ids is not None else None)
                 self.events.put(("progress", (100, "Preflight complete.")))
                 self.events.put(("preflight_done", report))
             except Exception:
@@ -468,14 +479,33 @@ class ConverterUI(tk.Tk):
                     self._append_log(json.dumps(report, indent=2))
                     self._set_busy(False, "Preflight passed." if report.get("status") == "PASS" else "Preflight failed.")
                     if report.get("status") == "PASS":
+                        warnings = report.get("warnings", [])
+                        warning_text = ""
+                        if warnings:
+                            warning_text = "\n\nWarnings:\n" + "\n".join(f"- {warning}" for warning in warnings)
+                        message_classes = report.get("message_classes", {})
+                        class_text = ", ".join(
+                            f"{letter}: {count}" for letter, count in message_classes.items()
+                        ) or "none"
+                        font_categories = report.get("font_categories", {})
+                        known_fonts = font_categories.get("known")
+                        font_text = (
+                            f"known {known_fonts}, unknown {font_categories.get('unknown')}"
+                            if known_fonts is not None else "not compared to a donor"
+                        )
+                        graphic_categories = report.get("graphic_categories", {})
                         messagebox.showinfo(
                             APP_TITLE,
                             "Preflight passed.\n\n"
                             f"Class-C schema: {report.get('class_c_profile')}\n"
                             f"Messages: {report.get('message_pairs')}\n"
-                            f"Class-C rows: {report.get('class_c_rows')}\n"
+                            f"Messages by class: {class_text}\n"
                             f"Frame rows: {report.get('frame_rows')}\n"
-                            f"Fonts: {report.get('fonts')}\nGraphics: {report.get('graphics')}",
+                            f"Fonts: {report.get('fonts')} ({font_text})\n"
+                            f"Graphics: {report.get('graphics')} "
+                            f"(colored {graphic_categories.get('colored', 0)}, "
+                            f"monochrome {graphic_categories.get('monochrome', 0)})"
+                            f"{warning_text}",
                         )
                     else:
                         messagebox.showerror(APP_TITLE, "Preflight failed. See the log for details.")
