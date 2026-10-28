@@ -35,7 +35,8 @@ sys.path.insert(0, str(HERE))
 import mtu_reverse as mr
 
 
-def build_model(mtu_path: Path, class_c_profile: str = "auto") -> dict:
+def build_model(mtu_path: Path, class_c_profile: str = "auto",
+                best_effort: bool = False) -> dict:
     raw = mtu_path.read_bytes()
     mtu = mr.MTU(raw)
 
@@ -55,7 +56,8 @@ def build_model(mtu_path: Path, class_c_profile: str = "auto") -> dict:
 
     font_metrics = mr.build_font_metrics(raw, fheaders, mtu.sections[3].offset)
     graphic_metrics = mr.build_graphic_metrics(raw, gheaders, mtu.sections[4].offset)
-    runtime_frames = mr.reconstruct_messageframes(banks, font_metrics, sign_tables, graphic_metrics)
+    runtime_frames = mr.reconstruct_messageframes(
+        banks, font_metrics, sign_tables, graphic_metrics, best_effort=best_effort)
     runtime_frames = mr.assign_color_frame_numbers(runtime_frames)
     runtime_frames = mr.collapse_compiler_rgb_placeholders(runtime_frames)
     color_zones = mr.reconstruct_color_zones(runtime_frames, sign_tables)
@@ -79,6 +81,7 @@ def build_model(mtu_path: Path, class_c_profile: str = "auto") -> dict:
         "color_zones": color_zones,
         "db_frames": db_frames,
         "class_c_profile": resolved_profile,
+        "best_effort": best_effort,
     }
 
 
@@ -128,11 +131,44 @@ def identify_unknown_message_tokens(model: dict, example_limit: int = 5) -> list
 
 def preflight_model(model: dict, known_font_ids: set[int] | None = None) -> dict:
     """Source-independent parser sanity checks before touching a Jet database."""
-    errors=[]; warnings=[]; unresolved=[]; unknown_masks=[]
+    errors=[]; warnings=[]; unresolved=[]; unknown_masks=[]; trailing_markers=[]
     unknown_token_catalog = identify_unknown_message_tokens(model)
     segment_count=0; control_count=0
     message_records=0
     message_classes = {}
+    best_effort = bool(model.get("best_effort", False))
+    recovery_anomalies = []
+    font_indexes = {int(font.get("CompiledFontIndex", index))
+                    for index, font in enumerate(model["resources"]["Fonts"])}
+    graphic_indexes = set(model["resources"].get("graphic_index_map", {}))
+    if best_effort:
+        warnings.append(
+            "Best-effort anomaly recovery is enabled. Editable appearance is unverified; "
+            "the original MTU bytes are retained unchanged. Review the recovery_anomalies report.")
+
+    def record_anomaly(kind: str, token: dict, letter: str, record: dict,
+                       segment: dict, action: str) -> None:
+        body = bytes.fromhex(segment.get("body_hex", ""))
+        offset = int(token.get("offset", 0))
+        entry = {
+            "kind": kind, "bank": letter, "message_code": int(record.get("msg_code", 0)),
+            "record_file_offset": f"0x{int(record.get('file_offset', 0)):X}",
+            "segment_index": int(segment.get("segment_index", 0)),
+            "token_offset": offset, "decoded_token": dict(token),
+            "selector_hex": segment.get("selector", {}).get("raw_hex", ""),
+            "target_lsign_ids": list(segment.get("target_lsign_ids", [])),
+            "physical_addresses": list(segment.get("selector", {}).get("physical_addresses", [])),
+            "context_hex": body[max(0, offset - 12):offset + 13].hex(" "),
+            "action": action if best_effort else f"blocked in strict mode; best-effort would {action}",
+        }
+        recovery_anomalies.append(entry)
+        location = (f"{letter}{entry['message_code']} segment {entry['segment_index']} "
+                    f"token +{offset} at record {entry['record_file_offset']}")
+        if best_effort:
+            warnings.append(f"{location}: {kind}; {action}. Appearance is unverified.")
+        elif kind == "invalid_font_selector":
+            errors.append(f"{location}: unknown compiled font index {token['font_index']}")
+
     for letter, bank in model["banks"].items():
         records = len(bank.get("records", []))
         if letter in "ABCDEFGHIJK" and records:
@@ -155,13 +191,38 @@ def preflight_model(model: dict, known_font_ids: set[int] | None = None) -> dict
                 for tok in seg.get("controls",[]):
                     if tok.get("kind") == "control":
                         control_count += 1
-                        if tok.get("semantic") == "unresolved": unresolved.append(tok.get("opcode"))
+                        if tok.get("semantic") == "font_selector" and tok["font_index"] not in font_indexes:
+                            record_anomaly(
+                                "invalid_font_selector", tok, letter, rec, seg,
+                                "keep consumed parameter bytes out of text; character signs ignore "
+                                "font changes and matrix signs retain the last valid/default font")
+                        elif (tok.get("semantic") == "graphic_selector" and
+                              tok["graphic_index"] not in graphic_indexes):
+                            errors.append(
+                                f"{letter}{rec.get('msg_code')} segment {seg.get('segment_index')}: "
+                                f"unknown compiled graphic index {tok['graphic_index']}")
+                        if tok.get("semantic") == "unresolved":
+                            unresolved.append(tok.get("opcode"))
+                            record_anomaly(
+                                "unresolved_control", tok, letter, rec, seg,
+                                "retain the original bytes; omit the unsupported rendering action")
+                        elif tok.get("semantic") == "trailing_marker":
+                            trailing_markers.append(
+                                f"{letter} message {rec.get('msg_code')} segment "
+                                f"{seg.get('segment_index')} at 0x{rec.get('file_offset',0):X}")
                     elif tok.get("kind") == "byte":
                         unresolved.append(f"byte_0x{int(tok.get('value',0)):02X}")
+                        record_anomaly(
+                            "raw_byte", tok, letter, rec, seg,
+                            "retain the original byte as non-rendering data in the editable recovery")
     if unknown_masks:
         errors.append(f"unknown sign selector masks: {sorted(set(unknown_masks))}")
-    if unresolved:
+    if unresolved and not best_effort:
         errors.append(f"unresolved message controls: {dict(defaultdict(int)) if False else sorted(set(unresolved))}")
+    if trailing_markers:
+        warnings.append(
+            "treated terminal 0x1E as a non-rendering marker in "
+            + ", ".join(trailing_markers))
     if model["banks"] and not message_records:
         warnings.append(
             "MTU contains no compiled message records; no Class A-K messages can be recovered")
@@ -180,6 +241,11 @@ def preflight_model(model: dict, known_font_ids: set[int] | None = None) -> dict
             errors.append(
                 f"logical sign {sign['LSignID']} has invalid dimensions "
                 f"{sign['LSignDotHeight']}x{sign['LSignDotWidth']}")
+    for i, row in enumerate(model.get("frames", [])):
+        if row.get("FontIndex") is not None and row["FontIndex"] not in font_indexes:
+            errors.append(f"frame {i} references unknown compiled font index {row['FontIndex']}")
+        if row.get("GraphicIndex") is not None and row["GraphicIndex"] not in graphic_indexes:
+            errors.append(f"frame {i} references unknown compiled graphic index {row['GraphicIndex']}")
     for i,r in enumerate(model["db_frames"]):
         if int(r["LSignID"]) not in lsign_ids: errors.append(f"frame {i} references unknown LSignID {r['LSignID']}")
         if r.get("FontID") is not None and int(r["FontID"]) not in font_ids: errors.append(f"frame {i} references unknown FontID {r['FontID']}")
@@ -207,6 +273,8 @@ def preflight_model(model: dict, known_font_ids: set[int] | None = None) -> dict
         "unknown_selector_masks":sorted(set(unknown_masks)),
         "unresolved_controls":sorted(set(unresolved)),
         "unknown_token_catalog":unknown_token_catalog,
+        "recovery_mode": "best_effort" if best_effort else "strict",
+        "recovery_anomalies": recovery_anomalies,
         "mtu_sha256":hashlib.sha256(model["raw_mtu"]).hexdigest(),
         "class_c_profile":model.get("class_c_profile","auto"),
     }
@@ -339,7 +407,7 @@ def class_message_element_rows(classes: dict[str, list[dict]], profile: str) -> 
 def enrich_physical_row(p: dict, default_font_names: dict[int, str] | None = None) -> dict:
     is_matrix = p["PSignType"] == "Matrix"
     default_font = (default_font_names or {}).get(
-        int(p["DefaultFontIndex"]), f"Recovered{int(p['DefaultFontIndex']):02d}")
+        int(p["DefaultFontIndex"]), mr.recovered_font_file_stem(int(p["DefaultFontIndex"])))
     return {
         "PSignID": p["PSignID"],
         "PSignName": p["PSignName"],
@@ -957,7 +1025,8 @@ def verify_written_database(db, model: dict) -> dict:
 
 
 def build_ips(mtu_path: Path, template_path: Path, out_path: Path, project_name: str,
-              class_c_profile: str = "auto", progress_callback=None):
+              class_c_profile: str = "auto", progress_callback=None,
+              best_effort: bool = False):
     def report_progress(percent: int, message: str) -> None:
         if progress_callback is not None:
             progress_callback(percent, message)
@@ -965,7 +1034,7 @@ def build_ips(mtu_path: Path, template_path: Path, out_path: Path, project_name:
     if template_path.resolve() == out_path.resolve():
         raise ValueError("Output path must differ from the template")
     report_progress(5, "Reading and decoding MTU...")
-    model=build_model(mtu_path, class_c_profile)
+    model=build_model(mtu_path, class_c_profile, best_effort=best_effort)
     report_progress(30, "Validating recovered model...")
     preflight=preflight_model(model)
     if preflight["status"] != "PASS":
@@ -1079,6 +1148,8 @@ def build_ips(mtu_path: Path, template_path: Path, out_path: Path, project_name:
         report_progress(90, "Verifying recovered database...")
         verification=verify_written_database(db,model)
         verification["preflight"] = preflight
+        verification["recovery_mode"] = preflight["recovery_mode"]
+        verification["warnings"] = preflight["warnings"]
     finally:
         try:
             db.Close()
@@ -1101,13 +1172,20 @@ def main():
     ap.add_argument("--class-c-profile", choices=("auto","legacy","expanded"), default="auto",
                     help="Class-C authoring schema; auto infers from compiled hardware")
     ap.add_argument("--preflight-only", action="store_true", help="parse/validate MTU without opening DAO or writing an IPS")
+    ap.add_argument("--best-effort", action="store_true",
+                    help="preserve decoded anomalies with warnings; editable appearance is unverified")
     args=ap.parse_args()
     if args.preflight_only:
-        report=preflight_model(build_model(args.mtu,args.class_c_profile))
+        report=preflight_model(build_model(
+            args.mtu,args.class_c_profile,best_effort=args.best_effort))
         print(json.dumps(report,indent=2))
         raise SystemExit(0 if report["status"]=="PASS" else 2)
-    _,verification=build_ips(args.mtu,args.template,args.output,args.name,args.class_c_profile)
+    _,verification=build_ips(
+        args.mtu,args.template,args.output,args.name,args.class_c_profile,
+        best_effort=args.best_effort)
     print(f"Wrote {args.output}")
+    for warning in verification["warnings"]:
+        print(f"WARNING: {warning}")
     print(f"Verification: {verification['status']} ({args.output}.verify.json)")
 
 if __name__=="__main__":

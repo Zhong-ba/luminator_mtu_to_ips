@@ -57,6 +57,7 @@ class ConverterUI(tk.Tk):
         self.profile_var = tk.StringVar(value="Auto")
         self.status_var = tk.StringVar(value="Select an MTU file to begin.")
         self.open_folder_var = tk.BooleanVar(value=True)
+        self.best_effort_var = tk.BooleanVar(value=False)
         self.progress_var = tk.DoubleVar(value=0)
 
         self._configure_style()
@@ -222,6 +223,14 @@ class ConverterUI(tk.Tk):
             style="Converter.TCheckbutton",
         ).grid(row=0, column=2, sticky="w")
 
+        self.best_effort_check = ttk.Checkbutton(
+            actions,
+            text="Best-effort anomaly recovery (editable appearance is unverified)",
+            variable=self.best_effort_var,
+            style="Converter.TCheckbutton",
+        )
+        self.best_effort_check.grid(row=1, column=0, columnspan=3, sticky="w", pady=(10, 0))
+
         activity = tk.Frame(
             root,
             bg="#111827",
@@ -339,6 +348,7 @@ class ConverterUI(tk.Tk):
         state = "disabled" if busy else "normal"
         self.preflight_btn.configure(state=state)
         self.convert_btn.configure(state=state)
+        self.best_effort_check.configure(state=state)
         if busy:
             self.progress_var.set(0)
         if status:
@@ -404,6 +414,7 @@ class ConverterUI(tk.Tk):
             return
 
         profile_key = self._profile_key()
+        best_effort = self.best_effort_var.get()
         donor_text = self.donor_var.get().strip()
         donor = Path(donor_text) if donor_text and Path(donor_text).is_file() else None
 
@@ -411,7 +422,7 @@ class ConverterUI(tk.Tk):
             try:
                 self.events.put(("log", f"Preflight: {mtu.name}  (Class-C: {profile_key})"))
                 self.events.put(("progress", (15, "Reading and decoding MTU...")))
-                model = builder.build_model(mtu, profile_key)
+                model = builder.build_model(mtu, profile_key, best_effort=best_effort)
                 self.events.put(("progress", (75, "Validating recovered model...")))
                 known_font_ids = None
                 if donor is not None:
@@ -442,6 +453,7 @@ class ConverterUI(tk.Tk):
             return
         project_name = (self.name_var.get().strip() or "RECOVERED")[:20]
         profile_key = self._profile_key()
+        best_effort = self.best_effort_var.get()
         if out.exists() and not messagebox.askyesno(APP_TITLE, f"Overwrite existing file?\n\n{out}"):
             return
 
@@ -451,9 +463,11 @@ class ConverterUI(tk.Tk):
                 self.events.put(("log", f"Donor:     {donor}"))
                 self.events.put(("log", f"Output:    {out}"))
                 self.events.put(("log", f"Class-C:   {profile_key}"))
+                self.events.put(("log", f"Recovery:  {'best-effort (unverified appearance)' if best_effort else 'strict'}"))
                 model, verification = builder.build_ips(
                     mtu, donor, out, project_name, profile_key,
                     lambda percent, status: self.events.put(("progress", (percent, status))),
+                    best_effort=best_effort,
                 )
                 cc = mr.reconstruct_class_c_by_profile(
                     model["frames"], model["sign_tables"], model["class_c_profile"]
@@ -480,6 +494,8 @@ class ConverterUI(tk.Tk):
                     self._set_busy(False, "Preflight passed." if report.get("status") == "PASS" else "Preflight failed.")
                     if report.get("status") == "PASS":
                         warnings = report.get("warnings", [])
+                        if warnings:
+                            self.status_var.set("Preflight passed with warnings. Review the log.")
                         warning_text = ""
                         if warnings:
                             warning_text = "\n\nWarnings:\n" + "\n".join(f"- {warning}" for warning in warnings)
@@ -494,9 +510,10 @@ class ConverterUI(tk.Tk):
                             if known_fonts is not None else "not compared to a donor"
                         )
                         graphic_categories = report.get("graphic_categories", {})
-                        messagebox.showinfo(
+                        notify = messagebox.showwarning if warnings else messagebox.showinfo
+                        notify(
                             APP_TITLE,
-                            "Preflight passed.\n\n"
+                            ("Preflight passed with warnings.\n\n" if warnings else "Preflight passed.\n\n") +
                             f"Class-C schema: {report.get('class_c_profile')}\n"
                             f"Messages: {report.get('message_pairs')}\n"
                             f"Messages by class: {class_text}\n"
@@ -513,10 +530,18 @@ class ConverterUI(tk.Tk):
                     out, verification = payload
                     self._append_log(json.dumps(verification, indent=2))
                     self._set_busy(False, f"Conversion complete: {out.name}")
-                    messagebox.showinfo(
+                    warnings = verification.get("warnings", [])
+                    notify = messagebox.showwarning if warnings else messagebox.showinfo
+                    warning_text = (
+                        f"\n\n{len(warnings)} warning(s). Review the log and verification report; "
+                        "database verification does not certify rendered appearance."
+                        if warnings else ""
+                    )
+                    notify(
                         APP_TITLE,
-                        "Conversion complete and post-write verification passed.\n\n"
-                        f"{out}\n\nA .verify.json report was written beside the IPS file.",
+                        "Conversion complete. Database row counts and original MTU bytes verified.\n\n"
+                        f"{out}\n\nA .verify.json report was written beside the IPS file."
+                        f"{warning_text}",
                     )
                     if self.open_folder_var.get():
                         try:

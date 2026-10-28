@@ -41,6 +41,15 @@ Preflight without writing a database:
 py build_ips_windows.py input.mtu Donor.ips unused.ips --preflight-only --class-c-profile auto
 ```
 
+For anomalous compiled data, explicitly enable best-effort recovery:
+
+```bat
+py build_ips_windows.py input.mtu Donor.ips recovered.ips --best-effort
+```
+
+The GUI provides the same option as **Best-effort anomaly recovery**, off by default.
+It also applies to preflight (`--preflight-only --best-effort`).
+
 Class-C options:
 
 ```text

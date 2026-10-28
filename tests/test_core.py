@@ -2,6 +2,8 @@ from pathlib import Path
 import sys
 from types import SimpleNamespace
 
+import pytest
+
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
@@ -43,6 +45,71 @@ def test_decode_selector_recognizes_legacy_empty_placeholder():
     assert selector["kind"] == "legacy_empty_selector"
     assert selector["targets"] == []
     assert selector["empty_placeholder"] is True
+
+
+@pytest.mark.parametrize(("mask_hex", "addresses", "targets"), [
+    ("00 02 01 10 02 02", [1, 12, 17], [1, 2, 7]),
+    ("00 02 01 D0 02 02", [1, 12, 14, 15, 17], [1, 2, 4, 5, 7]),
+])
+@pytest.mark.parametrize("offset", [0, 2])
+def test_decode_selector_distinguishes_three_masks_from_empty_placeholder(
+        mask_hex, addresses, targets, offset):
+    data = b"\x00" * offset + bytes.fromhex(f"ED 03 {mask_hex} F7 00 0A") + b"TEST"
+    address_map = {1: 1, 12: 2, 14: 4, 15: 5, 17: 7}
+
+    selector, used = mr.decode_selector(data, offset, address_map)
+
+    assert used == offset + 8
+    assert selector["kind"] == "selector_list"
+    assert selector["raw_hex"] == f"ed 03 {mask_hex.lower()}"
+    assert selector["physical_addresses"] == addresses
+    assert selector["targets"] == targets
+    assert selector["unknown_masks"] == []
+    assert not selector.get("empty_placeholder")
+
+
+@pytest.mark.parametrize("selector_hex", [
+    "ED 03", "ED 03 00 02", "ED 03 00 02 01", "ED 03 00 02 01 10",
+    "ED 03 00 02 01 10 02",
+])
+def test_decode_selector_rejects_truncated_three_mask_list(selector_hex):
+    with pytest.raises(ValueError, match="truncated ED selector list"):
+        mr.decode_selector(bytes.fromhex(selector_hex), 0, {1: 1})
+
+
+@pytest.mark.parametrize("placeholder_position", ["first", "middle", "last"])
+def test_parse_message_segments_preserves_empty_placeholder(placeholder_position):
+    populated = bytes.fromhex("00 02 F7 00 0A") + b"TEST"
+    placeholder = bytes.fromhex("ED 03 00")
+    parts = {
+        "first": [placeholder, populated],
+        "middle": [populated, placeholder, populated],
+        "last": [populated, placeholder],
+    }[placeholder_position]
+
+    segments = mr.parse_message_segments(b"\xFC".join(parts), {1: 1})
+
+    assert len(segments) == len(parts)
+    for segment, part in zip(segments, parts):
+        if part == placeholder:
+            assert segment["selector"]["empty_placeholder"] is True
+            assert segment["target_lsign_ids"] == []
+            assert segment["body_length"] == 0
+        else:
+            assert segment["target_lsign_ids"] == [1]
+            assert segment["text"] == "TEST"
+
+
+def test_parse_message_segments_keeps_three_mask_bytes_out_of_body():
+    payload = bytes.fromhex("ED 03 00 02 01 10 02 02 F7 00 0A") + b"TEST"
+
+    segments = mr.parse_message_segments(payload, {1: 1, 12: 2, 17: 7})
+
+    assert len(segments) == 1
+    assert segments[0]["target_lsign_ids"] == [1, 2, 7]
+    assert segments[0]["body_offset"] == 8
+    assert segments[0]["text"] == "TEST"
+    assert all(token["kind"] != "byte" for token in segments[0]["controls"])
 
 
 def test_decode_selector_recognizes_legacy_full_project_selector():
@@ -279,6 +346,119 @@ def test_font_body_hash_ignores_ips_authoring_header():
 
     assert builder._font_body_hash(blob_a) == builder._font_body_hash(blob_b)
     assert builder._font_body_hash(b"short") is None
+
+
+@pytest.mark.parametrize(("indexes", "chosen"), [
+    ([0], 0),
+    ([1], 1),
+    ([], 0),
+    ([0, 1, 1], 1),
+    ([1, 0], 0),
+])
+def test_reconstruct_resource_tables_selects_referenced_graphic_variant(indexes, chosen):
+    bodies = [
+        bytes.fromhex("00 04 00 08 01 00 01 00"),
+        bytes.fromhex("00 04 00 0C FF FF FF FF FF FF FF FF"),
+        bytes.fromhex("00 04 00 0C FF FF FF FF FF FF FF FF"),
+        bytes.fromhex("00 04 00 0C 00 00 00 00 00 00 00 00"),
+        bytes.fromhex("00 04 00 08 00 00 00 00"),
+    ]
+    raw = bytearray()
+    headers = []
+    for index, body in enumerate(bodies):
+        headers.append({
+            "index": index, "file_offset": len(raw),
+            "param0": 16 if index in (0, 4) else 14,
+            "param1": 1 if index in (0, 4) else 0, "param2": 0, "param3": 0,
+        })
+        raw.extend(body)
+    mtu = SimpleNamespace(sections=[None] * 4 + [SimpleNamespace(offset=len(raw))])
+    frames = [{"GraphicIndex": index} for index in indexes] + [{"GraphicIndex": None}, {}]
+
+    resources = mr.reconstruct_resource_tables(bytes(raw), mtu, [], headers, frames, {})
+    graphic = resources["Graphics"][0]
+
+    assert bytes.fromhex(graphic["GraphicBlobHex"])[28:] == bodies[chosen]
+    assert graphic["GraphicHeight"] == headers[chosen]["param0"]
+    assert graphic["GraphicWidth"] == mr.be16(bodies[chosen], 2)
+    assert graphic["RedGraphicBlobHex"] is None
+    assert graphic["GreenGraphicBlobHex"] is None
+    assert graphic["BlueGraphicBlobHex"] is None
+    assert resources["graphic_index_map"] == dict.fromkeys(range(5), 1)
+
+
+@pytest.mark.parametrize("resource_count", [0, 1, 5, 60, 501])
+def test_recovered_graphic_names_are_unique_and_eight_characters(resource_count):
+    body = bytes.fromhex("00 04 00 06 AA BB")
+    raw = body * resource_count
+    headers = [{
+        "index": index, "file_offset": index * len(body),
+        "param0": 16, "param1": 1, "param2": 0, "param3": 0,
+    } for index in range(resource_count)]
+    mtu = SimpleNamespace(sections=[None] * 4 + [SimpleNamespace(offset=len(raw))])
+
+    resources = mr.reconstruct_resource_tables(raw, mtu, [], headers, [], {})
+    graphics = resources["Graphics"]
+    names = [graphic["GraphicName"] for graphic in graphics]
+    group_size = 5 if resource_count and resource_count % 5 == 0 else 1
+
+    assert len(graphics) == resource_count // group_size
+    assert names == [f"RG{index:06d}" for index in range(len(graphics))]
+    assert all(len(name) == 8 and name.isascii() for name in names)
+    assert len({name.casefold() for name in names}) == len(names)
+    assert resources["graphic_index_map"] == {
+        index: index // group_size + 1 for index in range(resource_count)
+    }
+
+
+@pytest.mark.parametrize("resource_count", [0, 1, 12, 101])
+def test_recovered_font_filenames_use_unique_eight_character_stems(resource_count):
+    body = bytes.fromhex("00 04 00 06 AA BB")
+    raw = body * resource_count
+    headers = [{
+        "index": index, "file_offset": index * len(body),
+        "param0": 8, "param1": 1, "param2": 65, "param3": 65,
+    } for index in range(resource_count)]
+    mtu = SimpleNamespace(sections=[None] * 3 + [
+        SimpleNamespace(offset=len(raw)), SimpleNamespace(offset=len(raw)),
+    ])
+
+    resources = mr.reconstruct_resource_tables(raw, mtu, headers, [], [], {})
+    fonts = resources["Fonts"]
+    filenames = [font["FontFile"] for font in fonts]
+
+    assert filenames == [f"RF{index:06d}.fnt" for index in range(resource_count)]
+    assert all(len(Path(name).stem) == 8 and Path(name).suffix == ".fnt" for name in filenames)
+    assert len({name.casefold() for name in filenames}) == resource_count
+    assert [font["FontName"] for font in fonts] == [
+        f"Recovered{index:02d}" for index in range(resource_count)
+    ]
+    assert all(bytes.fromhex(font["FontBlobHex"])[28:] == body for font in fonts)
+    assert resources["font_index_map"] == {
+        index: index + 1 for index in range(resource_count)
+    }
+
+
+@pytest.mark.parametrize(("default_font_names", "expected"), [
+    (None, "RF000011"),
+    ({}, "RF000011"),
+    ({11: "L5vw"}, "L5vw"),
+    ({0: "Standard"}, "RF000011"),
+])
+def test_physical_default_font_uses_file_stem(default_font_names, expected):
+    physical = {
+        "PSignID": 1, "PSignName": "TEST", "PSignPartNumber": "TEST",
+        "PSignType": "Matrix", "DefaultFontIndex": 11,
+        "PSignDotHeight": 16, "PSignDotWidth": 160,
+        "PSignCharWidth": 0, "PSignCharLines": 0, "PSignNumChars": 0,
+        "PSignCharHeight": 0, "PSignLineTime": 16, "PSignBlankTime": 0,
+        "PSignBlankBeforePR": False, "PSignBlankBeforeRPT": False,
+        "Emergency": False, "PSignAddr": 1,
+    }
+
+    row = builder.enrich_physical_row(physical, default_font_names)
+
+    assert row["DefaultFont"] == expected
 
 
 def test_reconstruct_resource_tables_preserves_color_graphic_planes():

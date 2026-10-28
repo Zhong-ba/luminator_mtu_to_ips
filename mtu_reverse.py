@@ -29,6 +29,7 @@ import hashlib
 import json
 import re
 import struct
+from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
@@ -387,10 +388,10 @@ def decode_selector(data: bytes, off: int = 0, address_to_lsign: dict[int, int] 
     """
     if off + 2 > len(data):
         raise ValueError("truncated segment selector")
-    # Legacy compiler output uses this exact empty selector between FC-delimited
-    # segments and as a standalone blank message record. It carries no mask or
-    # renderable body and is distinct from the ED count-plus-mask-list form.
-    if data[off:off + 3] == b"\xED\x03\x00":
+    # The legacy empty marker ends at a segment boundary. The same prefix
+    # otherwise starts a three-mask selector whose first mask is on page zero.
+    if (data[off:off + 3] == b"\xED\x03\x00" and
+            (off + 3 == len(data) or data[off + 3] == 0xFC)):
         return {
             "kind": "legacy_empty_selector", "raw_hex": "ed 03 00", "masks": [],
             "masks_hex": [], "physical_addresses": [], "targets": [],
@@ -411,6 +412,7 @@ def decode_selector(data: bytes, off: int = 0, address_to_lsign: dict[int, int] 
         legacy_masks = {
             b"\x01\xFF\x02\x7F": [0x01FF, 0x027F],  # addresses 8..22
             b"\x01\x7F\x02\x04": [0x017F, 0x0204],  # addresses 8..14, 18
+            b"\x01\xBF\x02\x03": [0x01BF, 0x0203],  # addresses 8..13, 15..17
         }
         if data[off:off + 4] in legacy_masks:
             z = off + 4
@@ -515,6 +517,13 @@ def decode_segment_body(body: bytes) -> dict:
     i = 0
     while i < len(body):
         c = body[i]
+        if c == 0x1E and i == len(body) - 1:
+            controls.append({
+                "kind": "control", "offset": i, "opcode": "0x1E",
+                "params": [], "params_hex": "", "semantic": "trailing_marker",
+            })
+            i += 1
+            continue
         if c == 0x0D and i + 1 < len(body) and body[i + 1] == 0x0A:
             controls.append({"kind": "control", "offset": i, "opcode": "0x0D0A",
                              "params": [], "params_hex": "", "semantic": "line_ending"})
@@ -623,7 +632,8 @@ def _runtime_lsign_defaults(sign_tables: dict | None) -> dict[int, dict]:
 
 def reconstruct_messageframes(banks: dict, font_metrics: dict[int, dict] | None = None,
                               sign_tables: dict | None = None,
-                              graphic_metrics: dict[int, dict] | None = None) -> list[dict]:
+                              graphic_metrics: dict[int, dict] | None = None,
+                              best_effort: bool = False) -> list[dict]:
     """Build a database-neutral MessageFrames-equivalent row set from MTU only.
 
     This preserves runtime semantics.  Authoring-only flags that the compiler
@@ -666,6 +676,8 @@ def reconstruct_messageframes(banks: dict, font_metrics: dict[int, dict] | None 
                                      int(defaults.get("char_height") or 0) > 0))
                     if is_char_sign:
                         col = row = 0
+                        columns = (defaults["dot_width"] // defaults["char_width"]
+                                   if defaults["char_width"] > 0 else 0)
                         for tok in seg["controls"]:
                             if tok.get("kind") == "control":
                                 op = tok.get("opcode")
@@ -678,30 +690,36 @@ def reconstruct_messageframes(banks: dict, font_metrics: dict[int, dict] | None 
                                     line_time = tok["value"]
                             elif tok.get("kind") == "text":
                                 text = tok["text"]
-                                out.append({
-                                    "MsgClassID": msg_class,
-                                    "MsgCode": rec["msg_code"],
-                                    "LSignID": lid,
-                                    "Frame": frame,
-                                    "Break": 0,
-                                    "Phrase": text,
-                                    "GraphicIndex": None,
-                                    "FontIndex": defaults["default_font_index"],
-                                    "LineTime": line_time,
-                                    "HJustify": False,
-                                    "VJustify": False,
-                                    "XPos": col * defaults["char_width"] + 1,
-                                    "YPos": row * defaults["char_height"] + 1,
-                                    "Alert": False, "Scroll": False,
-                                    "Format": False, "Blink": False,
-                                    "Up": False, "Down": False, "Scroll2": False,
-                                    "ColorMask": color_mask,
-                                    "ColorIntensity": color_intensity,
-                                    "source_segment": seg["segment_index"],
-                                    "selector_hex": seg["selector"]["raw_hex"],
-                                })
-                                # Character signs advance in fixed character cells.
-                                col += len(text)
+                                while text:
+                                    chunk = text
+                                    if best_effort and columns:
+                                        extra_rows, col = divmod(col, columns)
+                                        row += extra_rows
+                                        chunk = text[:columns - col]
+                                    out.append({
+                                        "MsgClassID": msg_class,
+                                        "MsgCode": rec["msg_code"],
+                                        "LSignID": lid,
+                                        "Frame": frame,
+                                        "Break": 0,
+                                        "Phrase": chunk,
+                                        "GraphicIndex": None,
+                                        "FontIndex": defaults["default_font_index"],
+                                        "LineTime": line_time,
+                                        "HJustify": False,
+                                        "VJustify": False,
+                                        "XPos": col * defaults["char_width"] + 1,
+                                        "YPos": row * defaults["char_height"] + 1,
+                                        "Alert": False, "Scroll": False,
+                                        "Format": False, "Blink": False,
+                                        "Up": False, "Down": False, "Scroll2": False,
+                                        "ColorMask": color_mask,
+                                        "ColorIntensity": color_intensity,
+                                        "source_segment": seg["segment_index"],
+                                        "selector_hex": seg["selector"]["raw_hex"],
+                                    })
+                                    col += len(chunk)
+                                    text = text[len(chunk):]
                     else:
                         # Matrix signs have an implicit default font from the
                         # listing/configuration record. IPSComp may omit F7 when
@@ -718,7 +736,8 @@ def reconstruct_messageframes(banks: dict, font_metrics: dict[int, dict] | None 
                                     color_mask = tok["color_mask"]
                                     color_intensity = tok["color_intensity"]
                                 elif op == "0xF7":
-                                    font_index = tok["font_index"]
+                                    if not best_effort or tok["font_index"] in font_metrics:
+                                        font_index = tok["font_index"]
                                 elif op in ("0xF4", "0xF3"):
                                     x, y = tok["ips_xpos"], tok["ips_ypos"]
                                     pending_h = pending_v = False
@@ -1169,6 +1188,10 @@ def _authoring_blob_header(label: str, p0: int, p1: int, p2: int, p3: int) -> by
     return name + bytes((p0 & 0xff, p1 & 0xff, p2 & 0xff, p3 & 0xff, 0, 0))
 
 
+def recovered_font_file_stem(index: int) -> str:
+    return f"RF{index:06d}"
+
+
 def reconstruct_resource_tables(raw: bytes, mtu: MTU, fheaders: list[dict],
                                 gheaders: list[dict], frames: list[dict],
                                 sign_tables: dict) -> dict:
@@ -1190,7 +1213,7 @@ def reconstruct_resource_tables(raw: bytes, mtu: MTU, fheaders: list[dict],
             "FontID": i + 1, "CompiledFontIndex": i,
             "FontName": f"Recovered{i:02d}", "FontDescription": "Recovered from MTU",
             "FontType": "User", "FontSize": h["param0"],
-            "FontAllowMod": True, "FontFile": f"Recovered_{i:02d}.fnt",
+            "FontAllowMod": True, "FontFile": f"{recovered_font_file_stem(i)}.fnt",
             # FontWidth is authoring metadata discarded by compilation. The
             # compiled spacing parameter is retained as the safest surrogate.
             "FontWidth": max(1, h["param1"]),
@@ -1205,6 +1228,8 @@ def reconstruct_resource_tables(raw: bytes, mtu: MTU, fheaders: list[dict],
     group_count = len(gheaders) // group_size if group_size else len(gheaders)
     graphics = []
     graphic_index_map = {}
+    graphic_usage = Counter(
+        frame["GraphicIndex"] for frame in frames if frame.get("GraphicIndex") is not None)
     for group in range(group_count):
         members = list(range(group * group_size, min((group + 1) * group_size, len(gheaders))))
         blobs = []
@@ -1224,12 +1249,13 @@ def reconstruct_resource_tables(raw: bytes, mtu: MTU, fheaders: list[dict],
         )
         # An RGB source graphic is compiled as the base, red, green and blue
         # planes followed by an empty fallback. Preserve that ordering because
-        # IPS stores the planes in separate Graphics table blob fields. Other
-        # graphics retain the prior richest-variant selection.
+        # IPS stores the planes in separate Graphics table blob fields.
         if has_color_planes:
             chosen_idx, body = base_idx, base_body
         else:
-            chosen_idx, body = max(blobs, key=lambda ib: sum(1 for x in ib[1] if x))
+            # Alternate sign variants can contain unrelated, denser bitmaps.
+            # Prefer actual usage; ties and unused groups retain compiled order.
+            chosen_idx, body = max(blobs, key=lambda ib: graphic_usage[ib[0]])
         h = gheaders[chosen_idx]
         gid = group + 1
         for idx in members:
@@ -1241,7 +1267,7 @@ def reconstruct_resource_tables(raw: bytes, mtu: MTU, fheaders: list[dict],
         graphics.append({
             "GraphicID": gid, "CompiledGraphicGroup": group,
             "CompiledIndexes": ";".join(map(str, members)),
-            "GraphicName": f"RecoveredGraphic{group:02d}",
+            "GraphicName": f"RG{group:06d}",
             "GraphicDescription": "Recovered from MTU",
             "GraphicHeight": h["param0"], "GraphicWidth": width,
             "GraphicAllowMod": True, "GraphicCType": None,
