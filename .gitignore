@@ -32,4 +32,7 @@ Thumbs.db
 .vscode/
 .idea/
 
-tests/
+tests/*
+!tests/test_sign_catalog.py
+!tests/test_graphic_bindings.py
+!tests/test_compilation_metadata.py

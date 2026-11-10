@@ -27,12 +27,72 @@ import json
 import os
 import shutil
 import sys
-from collections import defaultdict
+from collections import Counter, defaultdict
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 import mtu_reverse as mr
+
+
+def _load_module_signature(blob: bytes) -> str | None:
+    if len(blob) < 512:
+        return None
+    normalized = bytearray(blob)
+    # Compilation patches payload length/check fields and the packed output version.
+    normalized[4:10] = bytes(6)
+    normalized[508:510] = bytes(2)
+    return hashlib.sha256(normalized).hexdigest()
+
+
+def compilation_metadata(mtu: mr.MTU) -> dict:
+    module = mtu.data[:mtu.master_offset]
+    packed = module[508:510] if len(module) >= 512 else b""
+    digits = [digit for byte in packed for digit in (byte >> 4, byte & 15)]
+    version = None
+    warnings = []
+    if len(digits) == 4 and all(digit < 10 for digit in digits):
+        version = 0
+        for digit in digits:
+            version = version * 10 + digit
+    else:
+        warnings.append(
+            f"Compiled output version is unavailable or not packed decimal "
+            f"({packed.hex(' ') or 'missing header'}); using the native IPS default "
+            "version 0, not an inferred source version.")
+    return {
+        "load_module_length": len(module),
+        "load_module_sha256": hashlib.sha256(module).hexdigest(),
+        "load_module_signature": _load_module_signature(module),
+        "output_version_raw_hex": packed.hex(" "),
+        "output_version": version,
+        "warnings": warnings,
+    }
+
+
+def donor_load_module_binding(db, metadata: dict) -> dict:
+    signature = metadata["load_module_signature"]
+    if signature is None:
+        raise RuntimeError("Cannot identify the embedded load module: its header is incomplete.")
+    rs = db.OpenRecordset("SELECT * FROM [LoadModules] ORDER BY [LoadModID]", 4)
+    try:
+        while not rs.EOF:
+            blob = bytes(rs.Fields("LOD").Value or b"")
+            if _load_module_signature(blob) == signature:
+                return {
+                    "load_mod_id": int(rs.Fields("LoadModID").Value),
+                    "description": str(rs.Fields("LMDescription").Value or ""),
+                    "donor_sha256": hashlib.sha256(blob).hexdigest(),
+                    "signature": signature,
+                }
+            rs.MoveNext()
+    finally:
+        rs.Close()
+    raise RuntimeError(
+        "No compatible load module was found in the donor. The embedded module "
+        f"contains {metadata['load_module_length']} bytes "
+        f"(signature {signature}). Use a donor containing the original controller module; "
+        "recovery will not substitute a different module, even in best-effort mode.")
 
 
 def build_model(mtu_path: Path, class_c_profile: str = "auto",
@@ -82,6 +142,7 @@ def build_model(mtu_path: Path, class_c_profile: str = "auto",
         "db_frames": db_frames,
         "class_c_profile": resolved_profile,
         "best_effort": best_effort,
+        "compilation_metadata": compilation_metadata(mtu),
     }
 
 
@@ -132,6 +193,10 @@ def identify_unknown_message_tokens(model: dict, example_limit: int = 5) -> list
 def preflight_model(model: dict, known_font_ids: set[int] | None = None) -> dict:
     """Source-independent parser sanity checks before touching a Jet database."""
     errors=[]; warnings=[]; unresolved=[]; unknown_masks=[]; trailing_markers=[]
+    warnings.extend(model.get("sign_catalog", {}).get("warnings", []))
+    warnings.extend(model.get("compilation_metadata", {}).get("warnings", []))
+    if model.get("load_module_error"):
+        errors.append(model["load_module_error"])
     unknown_token_catalog = identify_unknown_message_tokens(model)
     segment_count=0; control_count=0
     message_records=0
@@ -277,6 +342,8 @@ def preflight_model(model: dict, known_font_ids: set[int] | None = None) -> dict
         "recovery_anomalies": recovery_anomalies,
         "mtu_sha256":hashlib.sha256(model["raw_mtu"]).hexdigest(),
         "class_c_profile":model.get("class_c_profile","auto"),
+        "compilation_metadata": model.get("compilation_metadata"),
+        "load_module_binding": model.get("load_module_binding"),
     }
 
 
@@ -404,6 +471,135 @@ def class_message_element_rows(classes: dict[str, list[dict]], profile: str) -> 
     return out
 
 
+SIGN_CATALOG_FIELDS = (
+    "PSignPartNumber", "PSignName", "PSignDescription", "PSignType",
+    "PSignDotHeight", "PSignDotWidth", "PSignCharHeight", "PSignCharWidth",
+    "PSignCharLines", "PSignNumChars", "PSignDotColor",
+)
+
+
+def read_sign_catalog(db, source: str) -> list[dict]:
+    rs = db.OpenRecordset(
+        "SELECT " + ", ".join(f"[{field}]" for field in SIGN_CATALOG_FIELDS)
+        + " FROM [PhysicalSigns]", 4)
+    rows = []
+    try:
+        while not rs.EOF:
+            row = {field: rs.Fields(field).Value for field in SIGN_CATALOG_FIELDS}
+            row["source"] = source
+            rows.append(row)
+            rs.MoveNext()
+    finally:
+        rs.Close()
+    return rows
+
+
+def load_sign_catalog(engine, donor_db, donor_path: Path) -> tuple[list[dict], list[str]]:
+    installed = Path(os.environ.get("SystemDrive", "C:") + "\\") / "Luminator" / "IPS"
+    candidates = [
+        donor_path.parent / "IPS.ips", donor_path.parent / "IPS.mdb",
+        installed / "IPS.ips", installed / "IPS.mdb",
+    ]
+    rows = []
+    warnings = []
+    seen = {donor_path.resolve()}
+    for path in candidates:
+        resolved = path.resolve()
+        if resolved in seen or not path.is_file():
+            continue
+        seen.add(resolved)
+        try:
+            catalog_db = engine.OpenDatabase(str(resolved), False, True)
+            try:
+                rows.extend(read_sign_catalog(catalog_db, str(resolved)))
+            finally:
+                catalog_db.Close()
+        except Exception as error:
+            warnings.append(f"Could not read sign catalog {path}: {error}")
+    rows.extend(read_sign_catalog(donor_db, str(donor_path.resolve())))
+    return rows, warnings
+
+
+def apply_sign_catalog(signs: dict, catalog: list[dict],
+                       warnings: list[str] | None = None) -> dict:
+    """Bind display metadata only; compiled geometry and runtime defaults win."""
+    warnings = list(warnings or [])
+    matches = {}
+    for physical in signs["PhysicalSigns"]:
+        part = str(physical["PSignPartNumber"]).strip().upper()
+        kind = physical["PSignType"]
+        geometry_fields = (
+            ("PSignDotHeight", "PSignDotWidth") if kind == "Matrix" else
+            ("PSignCharHeight", "PSignCharWidth", "PSignCharLines", "PSignNumChars"))
+        match = next((
+            row for row in catalog
+            if str(row["PSignPartNumber"] or "").strip().upper() == part
+            and row["PSignType"] == kind
+            and all(row[field] == physical[field] for field in geometry_fields)
+            and row["PSignName"] and row["PSignDotColor"] is not None
+        ), None)
+        if match is None:
+            warnings.append(
+                f"Address {physical['PSignAddr']} type {part}: no matching sign catalog "
+                "entry for the compiled geometry; keeping synthetic names and fallback preview color.")
+            continue
+        physical.update({
+            "PSignName": str(match["PSignName"]),
+            "PSignDescription": str(match["PSignDescription"] or ""),
+            "PSignDotColor": int(match["PSignDotColor"]),
+            "name_origin": "native_catalog",
+        })
+        matches[physical["PSignID"]] = match
+
+    physical_by_id = {row["PSignID"]: row for row in signs["PhysicalSigns"]}
+    logical_by_id = {row["LSignID"]: row for row in signs["LogicalSigns"]}
+    counts = Counter(str(row["PSignName"])[:20].casefold() for row in signs["PhysicalSigns"])
+    used = set()
+    for physical in signs["PhysicalSigns"]:
+        base = str(physical["PSignName"])[:20]
+        name = base
+        if counts[base.casefold()] > 1:
+            suffix = f"_A{physical['PSignAddr']}"
+            name = base[:20 - len(suffix)] + suffix
+        ordinal = 2
+        while name.casefold() in used:
+            suffix = f"_{ordinal}"
+            name = base[:20 - len(suffix)] + suffix
+            ordinal += 1
+        used.add(name.casefold())
+        physical["PSignName"] = name
+
+    logical_used = {
+        str(logical_by_id[link["LSignID"]]["LSignName"]).casefold()
+        for link in signs["LogicalSignBuild"] if link["PSignID"] not in matches
+    }
+    bindings = []
+    for link in signs["LogicalSignBuild"]:
+        physical = physical_by_id[link["PSignID"]]
+        logical = logical_by_id[link["LSignID"]]
+        match = matches.get(link["PSignID"])
+        if match is not None:
+            name = physical["PSignName"]
+            ordinal = 1
+            while name.casefold() in logical_used:
+                suffix = f"_A{link['PSignAddr']}" + (f"_{ordinal}" if ordinal > 1 else "")
+                name = physical["PSignName"][:20 - len(suffix)] + suffix
+                ordinal += 1
+            logical_used.add(name.casefold())
+            logical.update({
+                "LSignName": name,
+                "LSignDescription": physical["PSignDescription"],
+                "name_origin": "native_catalog",
+            })
+        bindings.append({
+            "address": link["PSignAddr"], "part": physical["PSignPartNumber"],
+            "physical_name": physical["PSignName"], "logical_name": logical["LSignName"],
+            "preview_color": physical.get("PSignDotColor", 33023),
+            "source": match["source"] if match is not None else "synthetic",
+        })
+    return {"bindings": bindings, "warnings": warnings}
+
+
 def enrich_physical_row(p: dict, default_font_names: dict[int, str] | None = None) -> dict:
     is_matrix = p["PSignType"] == "Matrix"
     default_font = (default_font_names or {}).get(
@@ -411,12 +607,12 @@ def enrich_physical_row(p: dict, default_font_names: dict[int, str] | None = Non
     return {
         "PSignID": p["PSignID"],
         "PSignName": p["PSignName"],
-        "PSignDescription": "Recovered from compiled MTU",
+        "PSignDescription": p.get("PSignDescription", "Recovered from compiled MTU"),
         "PSignPartNumber": p["PSignPartNumber"],
         "PSignType": p["PSignType"], "PSignDotShape": "Round", "PSignDotAspect": "1/1",
         "PSignDotHeight": p["PSignDotHeight"], "PSignDotWidth": p["PSignDotWidth"],
         "PSignCharWidth": p["PSignCharWidth"], "PSignAllowMod": False,
-        "PSignDotColor": 33023, "PSignCharLines": p["PSignCharLines"],
+        "PSignDotColor": p.get("PSignDotColor", 33023), "PSignCharLines": p["PSignCharLines"],
         "PSignNumChars": p["PSignNumChars"], "PSignCharHeight": p["PSignCharHeight"],
         "PSignLineTime": p["PSignLineTime"], "PSignBlankTime": p["PSignBlankTime"],
         "PSignBlankBeforePR": p["PSignBlankBeforePR"],
@@ -662,10 +858,12 @@ def prepare_rows(model: dict, project_name: str,
     project_name = (project_name or "RECOVERED")[:20]
     signsets=[{
         "_local_id":1,
-        "LoadModID":2, "SignSetName":project_name,
+        "LoadModID":model["load_module_binding"]["load_mod_id"], "SignSetName":project_name,
         "SignSetDescription":"Recovered from compiled MTU", "SignSetOutputDate":datetime.datetime.now(),
         "SignSetOutputBytes":model["raw_mtu"], "Timing620":16, "Retention620":3,
-        "SignSetOutputVersion":99,
+        "SignSetOutputVersion": (
+            model["compilation_metadata"]["output_version"]
+            if model["compilation_metadata"]["output_version"] is not None else 0),
     }]
     return {
         "Fonts":fonts,"Graphics":graphics,"PhysicalSigns":physical,"LogicalSigns":logical,
@@ -714,6 +912,55 @@ def donor_font_bindings(db, fonts: list[dict]) -> tuple[dict[int, int], dict[int
         ids[local_id] = font_id
         if font_file:
             names[int(font["CompiledFontIndex"])] = Path(font_file).stem
+    return ids, names
+
+
+GRAPHIC_BLOB_FIELDS = ("Graphic", "RedGraphic", "GreenGraphic", "BlueGraphic")
+
+
+def _graphic_signature(height: int, width: int, blobs: list[bytes]) -> tuple | None:
+    if not blobs or len(blobs[0]) <= 28:
+        return None
+    parts = []
+    for blob in blobs:
+        if not blob:
+            parts.append(None)
+        elif len(blob) <= 28:
+            return None
+        else:
+            # Labels and the last two authoring-only header bytes are not compiled.
+            parts.append(hashlib.sha256(blob[22:26] + blob[28:]).hexdigest())
+    return int(height), int(width), tuple(parts)
+
+
+def donor_graphic_bindings(db, graphics: list[dict]) -> tuple[dict[int, int], dict[int, str]]:
+    """Reuse exact donor bitmaps, including compiled parameters and RGB planes."""
+    by_signature = {}
+    rs = db.OpenRecordset("SELECT * FROM [Graphics] ORDER BY [GraphicID]", 4)
+    try:
+        while not rs.EOF:
+            name = str(rs.Fields("GraphicName").Value or "")
+            if name != "#EFFDOT#":
+                key = _graphic_signature(
+                    rs.Fields("GraphicHeight").Value, rs.Fields("GraphicWidth").Value,
+                    [bytes(rs.Fields(field).Value or b"") for field in GRAPHIC_BLOB_FIELDS])
+                if key is not None and key not in by_signature:
+                    by_signature[key] = (int(rs.Fields("GraphicID").Value), name)
+            rs.MoveNext()
+    finally:
+        rs.Close()
+
+    ids = {}
+    names = {}
+    for graphic in graphics:
+        key = _graphic_signature(
+            graphic["GraphicHeight"], graphic["GraphicWidth"],
+            [bytes.fromhex(graphic.get(field + "BlobHex") or "")
+             for field in GRAPHIC_BLOB_FIELDS])
+        match = by_signature.get(key) if key is not None else None
+        if match is not None:
+            local_id = int(graphic["GraphicID"])
+            ids[local_id], names[local_id] = match
     return ids, names
 
 
@@ -997,6 +1244,8 @@ def verify_written_database(db, model: dict) -> dict:
     expected["ClassCMsgs"]=sum(1 for c,_ in pairs if c==3)
     expected["ClassMsgs"]=len(class_message_element_rows(
         class_message_rows(model), model.get("class_c_profile", "expanded")))
+    if "graphic_recovery" in model:
+        expected["Graphics"] = model["graphic_recovery"]["expected_graphics"]
     actual={}
     errors=[]
     for table,n in expected.items():
@@ -1007,6 +1256,27 @@ def verify_written_database(db, model: dict) -> dict:
     actual["SignSets"]=signsets
     if signsets != 1:
         errors.append(f"SignSets: expected 1, got {signsets}")
+    if signsets == 1 and "load_module_binding" in model:
+        try:
+            binding = model["load_module_binding"]
+            version = model["compilation_metadata"]["output_version"]
+            if version is None:
+                version = 0
+            rs = db.OpenRecordset("SELECT LoadModID, SignSetOutputVersion FROM SignSets", 4)
+            try:
+                saved_module_id = rs.Fields("LoadModID").Value
+                saved_version = rs.Fields("SignSetOutputVersion").Value
+            finally:
+                rs.Close()
+            if saved_module_id != binding["load_mod_id"] or saved_version != version:
+                errors.append("Saved load module selection or output version differs from the recovered metadata")
+            module = _read_long_binary(
+                db, f"SELECT LOD FROM LoadModules WHERE LoadModID={binding['load_mod_id']}", "LOD")
+            if (hashlib.sha256(module).hexdigest() != binding["donor_sha256"] or
+                    _load_module_signature(module) != binding["signature"]):
+                errors.append("Selected load module differs from the matched donor module")
+        except Exception as e:
+            errors.append(f"Could not verify compilation metadata: {e}")
     mtu_blob=b''
     if signsets == 1:
         try:
@@ -1015,6 +1285,65 @@ def verify_written_database(db, model: dict) -> dict:
                 errors.append(f"SignSetOutput differs from input MTU ({len(mtu_blob)} vs {len(model['raw_mtu'])} bytes)")
         except Exception as e:
             errors.append(f"Could not verify SignSetOutput BLOB: {e}")
+    if "sign_catalog" in model:
+        expected_metadata = Counter(
+            (row["address"], row["part"], row["physical_name"],
+             row["logical_name"], row["preview_color"])
+            for row in model["sign_catalog"]["bindings"])
+        try:
+            rs = db.OpenRecordset(
+                "SELECT b.PSignAddr, p.PSignPartNumber, p.PSignName, l.LSignName, p.PSignDotColor "
+                "FROM (LogicalSignBuild AS b INNER JOIN PhysicalSigns AS p ON b.PSignID=p.PSignID) "
+                "INNER JOIN LogicalSigns AS l ON b.LSignID=l.LSignID", 4)
+            actual_metadata = Counter()
+            try:
+                while not rs.EOF:
+                    actual_metadata[tuple(rs.Fields(i).Value for i in range(5))] += 1
+                    rs.MoveNext()
+            finally:
+                rs.Close()
+            if actual_metadata != expected_metadata:
+                errors.append("Saved sign names, addresses, part numbers or preview colors differ from the model")
+        except Exception as e:
+            errors.append(f"Could not verify sign catalog metadata: {e}")
+    if "graphic_recovery" in model:
+        try:
+            id_map = model["graphic_recovery"]["id_map"]
+            rs = db.OpenRecordset("SELECT * FROM [Graphics]", 4)
+            signatures = {}
+            try:
+                while not rs.EOF:
+                    signatures[int(rs.Fields("GraphicID").Value)] = _graphic_signature(
+                        rs.Fields("GraphicHeight").Value, rs.Fields("GraphicWidth").Value,
+                        [bytes(rs.Fields(field).Value or b"") for field in GRAPHIC_BLOB_FIELDS])
+                    rs.MoveNext()
+            finally:
+                rs.Close()
+            for graphic in model["resources"]["Graphics"]:
+                expected_signature = _graphic_signature(
+                    graphic["GraphicHeight"], graphic["GraphicWidth"],
+                    [bytes.fromhex(graphic.get(field + "BlobHex") or "")
+                     for field in GRAPHIC_BLOB_FIELDS])
+                graphic_id = id_map[int(graphic["GraphicID"])]
+                if expected_signature is None or signatures.get(graphic_id) != expected_signature:
+                    errors.append(f"Graphic {graphic_id}: saved bitmap, parameters or RGB planes differ")
+            expected_usage = Counter(
+                id_map[int(row["GraphicID"])] for row in model["db_frames"]
+                if row.get("GraphicID") is not None)
+            rs = db.OpenRecordset(
+                "SELECT GraphicID, Count(*) AS N FROM MessageFrames "
+                "WHERE GraphicID IS NOT NULL GROUP BY GraphicID", 4)
+            actual_usage = Counter()
+            try:
+                while not rs.EOF:
+                    actual_usage[int(rs.Fields("GraphicID").Value)] = int(rs.Fields("N").Value)
+                    rs.MoveNext()
+            finally:
+                rs.Close()
+            if actual_usage != expected_usage:
+                errors.append("Saved message graphic usages differ from the remapped model")
+        except Exception as e:
+            errors.append(f"Could not verify recovered graphics: {e}")
     return {
         "status":"PASS" if not errors else "FAIL",
         "expected_counts":expected, "actual_counts":actual,
@@ -1051,6 +1380,11 @@ def build_ips(mtu_path: Path, template_path: Path, out_path: Path, project_name:
     pythoncom, VARIANT, engine, db=open_dao(out_path, exclusive=True)
     ws=engine.Workspaces(0)
     try:
+        model["load_module_binding"] = donor_load_module_binding(
+            db, model["compilation_metadata"])
+        catalog, catalog_warnings = load_sign_catalog(engine, db, template_path)
+        model["sign_catalog"] = apply_sign_catalog(model["sign_tables"], catalog, catalog_warnings)
+        preflight = preflight_model(model)
         classes=class_message_rows(model)
         class_elements=class_message_element_rows(classes, model["class_c_profile"])
         if model["class_c_profile"]=="legacy":
@@ -1076,10 +1410,21 @@ def build_ips(mtu_path: Path, template_path: Path, out_path: Path, project_name:
             font_map, default_font_names = donor_font_bindings(db, model["resources"]["Fonts"])
             base=prepare_rows(model, project_name, default_font_names)
             missing_fonts=[r for r in base["Fonts"] if int(r["FontID"]) not in font_map]
+            graph_map, graphic_names = donor_graphic_bindings(db, base["Graphics"])
+            missing_graphics = [
+                row for row in base["Graphics"] if int(row["GraphicID"]) not in graph_map]
+            model["graphic_recovery"] = {
+                "reused": [
+                    {"local_id": local_id, "graphic_id": graphic_id, "name": graphic_names[local_id]}
+                    for local_id, graphic_id in graph_map.items()],
+                "inserted": len(missing_graphics),
+                "expected_graphics": int(_scalar(db, "SELECT Count(*) AS N FROM Graphics"))
+                + len(missing_graphics),
+            }
             message_pairs = {(int(row["MsgClassID"]), int(row["MsgCode"])) for row in model["db_frames"]}
             metadata_elements, metadata_columns = class_c_metadata_rows(model["class_c_profile"])
             write_counts = [
-                ("Fonts", len(missing_fonts)), ("Graphics", len(base["Graphics"])),
+                ("Fonts", len(missing_fonts)), ("Graphics", len(missing_graphics)),
                 ("PhysicalSigns", len(base["PhysicalSigns"])), ("LogicalSigns", len(base["LogicalSigns"])),
                 ("SignSets", len(base["SignSets"])), ("LogicalSignBuild", len(model["sign_tables"]["LogicalSignBuild"])),
                 ("SignSetBuild", len(model["sign_tables"]["SignSetBuild"])), ("EffectZones", len(model["effect_zones"])),
@@ -1107,12 +1452,13 @@ def build_ips(mtu_path: Path, template_path: Path, out_path: Path, project_name:
                 db,"Fonts",missing_fonts,"FontID",blob_fields={"FontBlobHex":"Font"},
                 pythoncom=pythoncom,VARIANT=VARIANT,row_callback=report_written_row)
             )
-            graph_map=append_autonumber_rows(
-                db,"Graphics",base["Graphics"],"GraphicID",blob_fields={
+            graph_map.update(append_autonumber_rows(
+                db,"Graphics",missing_graphics,"GraphicID",blob_fields={
                     "GraphicBlobHex":"Graphic", "RedGraphicBlobHex":"RedGraphic",
                     "GreenGraphicBlobHex":"GreenGraphic", "BlueGraphicBlobHex":"BlueGraphic",
                 },
-                pythoncom=pythoncom,VARIANT=VARIANT,row_callback=report_written_row)
+                pythoncom=pythoncom,VARIANT=VARIANT,row_callback=report_written_row))
+            model["graphic_recovery"]["id_map"] = graph_map
             p_map=append_autonumber_rows(
                 db,"PhysicalSigns",base["PhysicalSigns"],"PSignID",
                 pythoncom=pythoncom,VARIANT=VARIANT,row_callback=report_written_row)
@@ -1150,6 +1496,10 @@ def build_ips(mtu_path: Path, template_path: Path, out_path: Path, project_name:
         verification["preflight"] = preflight
         verification["recovery_mode"] = preflight["recovery_mode"]
         verification["warnings"] = preflight["warnings"]
+        verification["sign_catalog"] = model["sign_catalog"]
+        verification["graphic_recovery"] = model["graphic_recovery"]
+        verification["compilation_metadata"] = model["compilation_metadata"]
+        verification["load_module_binding"] = model["load_module_binding"]
     finally:
         try:
             db.Close()

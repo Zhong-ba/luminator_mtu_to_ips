@@ -1241,22 +1241,40 @@ def reconstruct_resource_tables(raw: bytes, mtu: MTU, fheaders: list[dict],
         base_idx, base_body = blobs[0]
         base_width = be16(base_body, 2) if len(base_body) >= 4 else 0
         color_plane_indexes = members[1:4]
-        has_color_planes = (
+        color_plane_candidate = (
             len(members) == 5 and len(color_plane_indexes) == 3 and
             all(gheaders[idx]["param1"] == 0 and len(by_index[idx]) >= 4 and
                 be16(by_index[idx], 2) == base_width for idx in color_plane_indexes) and
             any(any(by_index[idx][4:]) for idx in color_plane_indexes)
         )
+        # Some monochrome groups have three six-byte compiled placeholders,
+        # not editable RGB bitmaps. Their end pointer exceeds the stored data.
+        has_placeholder_planes = (
+            color_plane_candidate and base_width > 6 and
+            all(by_index[idx] == base_body[:4] + b"\x00\xff"
+                for idx in color_plane_indexes))
+        has_color_planes = color_plane_candidate and not has_placeholder_planes
+        if has_color_planes:
+            for idx in color_plane_indexes:
+                plane = by_index[idx]
+                if not 4 <= be16(plane) <= be16(plane, 2) <= len(plane):
+                    raise ValueError(
+                        f"Graphic group {group}, color plane index {idx}: "
+                        f"invalid bitmap bounds ({be16(plane)}..{be16(plane, 2)} "
+                        f"in {len(plane)} bytes)")
         # An RGB source graphic is compiled as the base, red, green and blue
         # planes followed by an empty fallback. Preserve that ordering because
         # IPS stores the planes in separate Graphics table blob fields.
-        if has_color_planes:
+        if has_color_planes or has_placeholder_planes:
             chosen_idx, body = base_idx, base_body
         else:
             # Alternate sign variants can contain unrelated, denser bitmaps.
             # Prefer actual usage; ties and unused groups retain compiled order.
             chosen_idx, body = max(blobs, key=lambda ib: graphic_usage[ib[0]])
         h = gheaders[chosen_idx]
+        if len(body) < 4 or not 4 <= be16(body) <= be16(body, 2) <= len(body):
+            raise ValueError(
+                f"Graphic group {group}, compiled index {chosen_idx}: invalid bitmap bounds")
         gid = group + 1
         for idx in members:
             graphic_index_map[idx] = gid

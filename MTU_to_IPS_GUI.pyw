@@ -427,15 +427,23 @@ class ConverterUI(tk.Tk):
                 known_font_ids = None
                 if donor is not None:
                     try:
-                        pythoncom, _, _, db = builder.open_dao(donor)
+                        pythoncom, _, engine, db = builder.open_dao(donor)
                         try:
+                            try:
+                                model["load_module_binding"] = builder.donor_load_module_binding(
+                                    db, model["compilation_metadata"])
+                            except RuntimeError as error:
+                                model["load_module_error"] = str(error)
+                            catalog, catalog_warnings = builder.load_sign_catalog(engine, db, donor)
+                            model["sign_catalog"] = builder.apply_sign_catalog(
+                                model["sign_tables"], catalog, catalog_warnings)
                             known_font_ids, _ = builder.donor_font_bindings(
                                 db, model["resources"]["Fonts"])
                         finally:
                             db.Close()
                             pythoncom.CoUninitialize()
                     except Exception as error:
-                        self.events.put(("log", f"Font comparison unavailable: {error}"))
+                        self.events.put(("log", f"Load-module/sign/font comparison unavailable: {error}"))
                 report = builder.preflight_model(
                     model, set(known_font_ids) if known_font_ids is not None else None)
                 self.events.put(("progress", (100, "Preflight complete.")))
