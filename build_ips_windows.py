@@ -315,6 +315,9 @@ def preflight_model(model: dict, known_font_ids: set[int] | None = None) -> dict
         if int(r["LSignID"]) not in lsign_ids: errors.append(f"frame {i} references unknown LSignID {r['LSignID']}")
         if r.get("FontID") is not None and int(r["FontID"]) not in font_ids: errors.append(f"frame {i} references unknown FontID {r['FontID']}")
         if r.get("GraphicID") is not None and int(r["GraphicID"]) not in graph_ids: errors.append(f"frame {i} references unknown GraphicID {r['GraphicID']}")
+        if r.get("GraphicID") is None and r.get("FontID") is None:
+            errors.append(f"frame {i} (class {r['MsgClassID']} msg {r['MsgCode']} sign {r['LSignID']} "
+                          f"frame {r['Frame']}) has neither FontID nor GraphicID; IPS compile would fail")
     group_keys={(int(r["MsgClassID"]),int(r["MsgCode"]),int(r["LSignID"]),int(r["Frame"])) for r in model["db_frames"]}
     zone_keys={(int(r["MsgClassID"]),int(r["MsgCode"]),int(r["LSignID"]),int(r["Frame"])) for r in model["effect_zones"]}
     if group_keys != zone_keys:
@@ -715,9 +718,8 @@ def table_field_info(db, table: str) -> dict[str, tuple[int, int, bool, bool]]:
     """Return Jet field constraints used by the writer.
 
     Values are ``(DAO type, declared size, allow_zero_length, required)``.
-    Jet distinguishes an empty text string from NULL.  Several IPS authoring
-    columns (notably expanded Class-C fields such as DestinationBot) disallow
-    zero-length strings but happily accept NULL for an unused value.
+    Jet distinguishes an empty text string from NULL.  Fields that disallow
+    zero-length strings receive NULL for an unused value instead.
     """
     td = db.TableDefs(table)
     out = {}
@@ -745,9 +747,8 @@ def _fit_field_value(value, info: tuple[int, int, bool, bool] | None):
     """Coerce a Python value to the live Jet field constraints.
 
     * Text is truncated to its declared maximum.
-    * ``""`` becomes NULL when ``AllowZeroLength`` is false.  This mirrors
-      native IPS projects, where unused Class-C authoring fields are NULL rather
-      than zero-length strings.
+    * ``""`` becomes NULL when ``AllowZeroLength`` is false.  Native IPS
+      Class-C columns allow zero-length strings (see _ensure_class_c_fields).
     Binary/OLE values are never truncated here.
     """
     if value is None or info is None:
@@ -1084,14 +1085,33 @@ def remap_dependent_rows(model: dict, maps: dict[str, dict[int,int]], signset_id
     }
 
 
+def _ensure_class_c_fields(tdf, defs) -> set[str]:
+    """Append missing ClassCMsgs columns and return the resulting field names.
+
+    Native IPS stores unused Class-C text elements as zero-length strings and
+    its compiler reads them without Null checks ("fcplcmdCompile: Invalid use of
+    Null").  DAO's CreateField defaults AllowZeroLength to False, which would
+    make the writer coerce "" to NULL, so text columns must explicitly allow it.
+    """
+    existing = {str(tdf.Fields(i).Name) for i in range(tdf.Fields.Count)}
+    for name, dtype, size in defs:
+        if name in existing:
+            fld = tdf.Fields(name)
+            if dtype == 10 and int(fld.Type) == 10 and not bool(fld.AllowZeroLength):
+                fld.AllowZeroLength = True
+            continue
+        fld = tdf.CreateField(name, dtype, size) if size else tdf.CreateField(name, dtype)
+        if dtype == 10:
+            fld.AllowZeroLength = True
+        tdf.Fields.Append(fld)
+        existing.add(name)
+    return existing
+
+
 def ensure_legacy_class_c_schema(db) -> None:
     """Upgrade the blank donor to legacy Route/Destination/SmallSide shape."""
     tdf=db.TableDefs("ClassCMsgs")
-    existing={str(tdf.Fields(i).Name) for i in range(tdf.Fields.Count)}
-    for name,dtype,size in (("SmallSide",10,255),("IDSmallSide",4,None)):
-        if name in existing:continue
-        fld=tdf.CreateField(name,dtype,size) if size else tdf.CreateField(name,dtype)
-        tdf.Fields.Append(fld); existing.add(name)
+    existing=_ensure_class_c_fields(tdf, (("SmallSide",10,255),("IDSmallSide",4,None)))
     missing={"SmallSide","IDSmallSide"}-existing
     if missing:raise RuntimeError("Could not add legacy ClassC fields: "+", ".join(sorted(missing)))
 
@@ -1104,7 +1124,6 @@ def ensure_expanded_class_c_schema(db) -> None:
     authoring columns is non-destructive; the legacy Destination pair is retained.
     """
     tdf = db.TableDefs("ClassCMsgs")
-    existing = {str(tdf.Fields(i).Name) for i in range(tdf.Fields.Count)}
     # DAO DataTypeEnum: dbLong=4, dbText=10.
     defs = [
         ("DestinationTop", 10, 255), ("IDDestinationTop", 4, None),
@@ -1112,12 +1131,7 @@ def ensure_expanded_class_c_schema(db) -> None:
         ("DestinationSide", 10, 255), ("IDDestinationSide", 4, None),
         ("RouteSide", 10, 255), ("IDRouteSide", 4, None),
     ]
-    for name, dtype, size in defs:
-        if name in existing:
-            continue
-        fld = tdf.CreateField(name, dtype, size) if size else tdf.CreateField(name, dtype)
-        tdf.Fields.Append(fld)
-        existing.add(name)
+    existing = _ensure_class_c_fields(tdf, defs)
     required = {x[0] for x in defs}
     missing = required - existing
     if missing:

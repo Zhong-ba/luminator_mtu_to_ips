@@ -839,16 +839,20 @@ def reconstruct_messageframes(banks: dict, font_metrics: dict[int, dict] | None 
                         "line_time": 0, "char_width": 1, "char_height": 1,
                         "default_font_index": 0, "dot_width": 0, "dot_height": 0,
                     }))
+                        # A blank segment carries no F7 selector, but IPS requires
+                        # every non-graphic frame to have a font (a NULL FontID
+                        # aborts compile with "Invalid use of Null").  Native
+                        # projects keep the font in effect for that sign/message.
+                        inherited_font = next(
+                            (r["FontIndex"] for r in reversed(out)
+                             if r["MsgClassID"] == msg_class and r["MsgCode"] == rec["msg_code"]
+                             and r["LSignID"] == lid and r.get("FontIndex") is not None),
+                            defaults.get("default_font_index"))
                         out.append({
                             "MsgClassID": msg_class, "MsgCode": rec["msg_code"],
                             "LSignID": lid, "Frame": frame, "Break": 0,
                             "Phrase": "", "GraphicIndex": None,
-                            # A blank segment carries no matrix F7 selector. Keep
-                            # matrix placeholder FontIndex unset; character signs
-                            # have an implicit default font from their listing.
-                            "FontIndex": (defaults.get("default_font_index")
-                                          if defaults.get("sign_type", "Char" if lid == 1 else "Matrix") == "Char"
-                                          else None),
+                            "FontIndex": inherited_font,
                             "LineTime": defaults["line_time"],
                             "HJustify": False, "VJustify": False,
                             "XPos": 1, "YPos": 1,
