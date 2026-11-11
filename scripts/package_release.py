@@ -15,14 +15,40 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+from version import PRODUCT_NAME, __version__  # noqa: E402
+
 APP_NAME = "Luminator-MTU-to-IPS"
 ENTRY_POINT = ROOT / "MTU_to_IPS_GUI.pyw"
 REQUIRED_SOURCES = (
     ROOT / "build_ips_windows.py",
     ROOT / "class_c_elements.py",
     ROOT / "mtu_reverse.py",
+    ROOT / "version.py",
     ROOT / "PROBE_DAO.vbs",
 )
+
+
+def write_version_resource(path: Path) -> None:
+    """Windows VERSIONINFO shown in the executable's Properties > Details tab."""
+    parts = [int(part) for part in __version__.split(".")]
+    numbers = tuple((parts + [0, 0, 0, 0])[:4])
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(f"""VSVersionInfo(
+  ffi=FixedFileInfo(filevers={numbers}, prodvers={numbers}, mask=0x3f, flags=0x0,
+                    OS=0x40004, fileType=0x1, subtype=0x0, date=(0, 0)),
+  kids=[
+    StringFileInfo([StringTable('040904B0', [
+      StringStruct('ProductName', {PRODUCT_NAME!r}),
+      StringStruct('FileDescription', {PRODUCT_NAME!r}),
+      StringStruct('ProductVersion', {__version__!r}),
+      StringStruct('FileVersion', {__version__!r}),
+      StringStruct('InternalName', {APP_NAME!r}),
+      StringStruct('OriginalFilename', {APP_NAME + '.exe'!r})])]),
+    VarFileInfo([VarStruct('Translation', [0x0409, 1200])])
+  ]
+)
+""", encoding="utf-8")
 
 
 def parse_args() -> argparse.Namespace:
@@ -70,6 +96,9 @@ def main() -> int:
             elif path.exists():
                 path.unlink()
 
+    version_file = build_dir / "version_info.txt"
+    write_version_resource(version_file)
+
     command = [
         sys.executable,
         "-m",
@@ -80,6 +109,8 @@ def main() -> int:
         "--windowed",
         "--name",
         APP_NAME,
+        "--version-file",
+        str(version_file),
         "--distpath",
         str(dist_dir),
         "--workpath",
@@ -99,7 +130,7 @@ def main() -> int:
         command.extend(("--add-data", f"{ROOT / 'Donor.ips'};."))
     command.append(str(ENTRY_POINT))
 
-    print("Building with:", sys.executable)
+    print(f"Building {PRODUCT_NAME} {__version__} with:", sys.executable)
     subprocess.run(command, cwd=ROOT, check=True)
 
     executable = release_dir / f"{APP_NAME}.exe"

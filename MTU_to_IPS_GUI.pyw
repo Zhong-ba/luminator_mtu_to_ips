@@ -569,9 +569,11 @@ class ConverterUI(tk.Tk):
                         "Suggested Class C elements: " + ", ".join(layout.elements)
                         + f"\n  Messages needing each element (of {messages}): "
                         + ", ".join(f"{name} {usage.get(name, 0)}" for name in cce.ELEMENTS))
-                    self._set_busy(False, "Class C elements suggested. Adjust the checkboxes if needed.")
+                    self._set_busy(False)
+                    self._set_progress(100, "Class C elements suggested. Adjust the checkboxes if needed.")
                 elif kind == "groups_done":
-                    self._set_busy(False, "Name the Class C element groups.")
+                    self._set_busy(False)
+                    self._set_progress(100, "Name the Class C element groups.")
                     dialog = CustomElementsDialog(self, payload, self.custom_layout)
                     self.wait_window(dialog)
                     if dialog.result == "standard":
