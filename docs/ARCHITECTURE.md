@@ -59,27 +59,21 @@ Examples of recovered semantics:
 
 The parser also handles implicit cursor advance based on compiled glyph widths and implicit matrix default fonts from the sign configuration.
 
-## Class-C profiles
+## Class C elements
 
-### Expanded
+Element labels are not compiled into the MTU, so `class_c_elements.py` rebuilds them from cross-sign structure for the user-chosen layout (`RouteFront`, `MainFront`, `SecondaryFront`, `RouteSide`, `MainSide`, `RouteRear`).
 
-```text
-Route
-DestinationTop
-DestinationBot
-DestinationSide
-RouteSide
-```
+Signs are grouped by display geometry, which is stable across part families (08Bx, 04xx) and works for MTUs that serve several vehicle types: displays at most 48 dots wide are rear/route displays (any number of them), displays at most 8 dots tall are sides, and the rest — including 112x14 "Titan side" displays — are front-family with the ODK last. The canonical front is the widest 16-dot display.
 
-### Legacy
+1. **Route**: text the rear displays show marks route items on the other signs, including split glyph runs such as `N` + `1` or a superscript `S`. A route starts on the top line of its frame, so matching text on a lower line stays destination. Without a rear sign, a route-like token (or a short letter badge beside lower, smaller text) repeated in every frame is used.
+2. **Main / secondary**: on front-family signs the top non-route line is the main destination; a lower line in a different font is the secondary destination. Non-canonical front signs follow the canonical front's text where it matches.
+3. **Side**: when chosen, `RouteSide`/`MainSide` are always filled from the side signs. When not chosen, side text takes the front element showing the same text, else the parent element.
+4. **Rear**: when chosen, `RouteRear` is always filled from the rear displays. Otherwise a rear that is not a front route becomes the secondary destination when the front has no route, else `RouteFront`.
+5. **Folding**: unchosen elements resolve to their parent (`RouteSide`/`RouteRear` → `RouteFront` → `MainFront`; `MainSide`/`SecondaryFront` → `MainFront`).
 
-```text
-Route
-Destination
-SmallSide
-```
+Suggestions check front elements whose content occurs, and side/rear elements only when those signs differ from the front in at least 2% of messages.
 
-The compiled MTU stores sign-specific rendered elements rather than database column labels. Reconstruction therefore uses sign roles, geometry, frame ordering, and cross-sign text relationships.
+Graphics use ElementID 0 and blank frames take their sign's dominant element. Listing text joins frames with `^` and in-frame lines with `÷`. The writer makes `ClassCMsgs` hold exactly the chosen element columns (zero-length strings allowed) and leaves `ClassMsgs` empty, as native IPS projects do.
 
 ## Jet writing
 

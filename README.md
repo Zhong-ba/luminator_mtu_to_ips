@@ -14,8 +14,7 @@ The converter reconstructs the runtime-visible project data contained in an MTU,
 - text, positions, timing and effects
 - compiled fonts and graphics
 - RGB color planes and IPS color zones
-- legacy Class-C projects: `Route / Destination / SmallSide`
-- expanded Class-C projects: `Route / DestinationTop / DestinationBot / DestinationSide / RouteSide`
+- Class C (destination) authoring elements chosen by you — see [Class C elements](#class-c-elements)
 - the original MTU embedded back into `SignSetOutput`
 
 The output database is written through Microsoft Jet/DAO so it can be opened and edited by Luminator IPS. The converter has a determinate progress display for decode, validation, database writing, and post-write verification.
@@ -32,13 +31,19 @@ Double-click `SETUP_AND_RUN.cmd` to start the desktop converter. It probes 32-bi
 ## Command Line
 
 ```bat
-py build_ips_windows.py input.mtu Donor.ips recovered.ips --name RECOVERED --class-c-profile auto
+py build_ips_windows.py input.mtu Donor.ips recovered.ips --name RECOVERED
+```
+
+Choose the Class C elements explicitly (otherwise they are suggested from the MTU):
+
+```bat
+py build_ips_windows.py input.mtu Donor.ips recovered.ips --class-c-elements RouteFront,MainFront,SecondaryFront,MainSide
 ```
 
 Preflight without writing a database:
 
 ```bat
-py build_ips_windows.py input.mtu Donor.ips unused.ips --preflight-only --class-c-profile auto
+py build_ips_windows.py input.mtu Donor.ips unused.ips --preflight-only
 ```
 
 For anomalous compiled data, explicitly enable best-effort recovery:
@@ -50,13 +55,24 @@ py build_ips_windows.py input.mtu Donor.ips recovered.ips --best-effort
 The GUI provides the same option as **Best-effort anomaly recovery**, off by default.
 It also applies to preflight (`--preflight-only --best-effort`).
 
-Class-C options:
+## Class C Elements
 
-```text
-auto
-legacy
-expanded
-```
+Element names, listing columns and each frame's element binding are authoring metadata that IPS discards when compiling, so they are not stored in the MTU. You choose which elements the recovered project has; the GUI shows them as checkboxes and **Suggest from MTU** pre-selects the ones the messages need.
+
+| Element | Meaning |
+|---|---|
+| `RouteFront` | route number on the front-family signs (front, Titan, ODK) |
+| `MainFront` | main destination (always present; replaces `Destination` / `DestinationTop`) |
+| `SecondaryFront` | lower destination line in a different font (replaces `DestinationBot`) |
+| `RouteSide` | route number on the side signs |
+| `MainSide` | side destination (replaces `DestinationSide` / `SmallSide`) |
+| `RouteRear` | what the rear/route displays show |
+
+Sign roles come from display geometry, so 08Bx and 04xx sign families and multi-vehicle MTUs are handled: displays up to 48 dots wide are rear/route displays, displays up to 8 dots tall are sides, and the rest are fronts.
+
+A checked side or rear element is always filled from its signs, even when they show the same text as the front. Unchecked elements fold into their parent: `RouteSide`/`RouteRear` → `RouteFront`, `MainSide`/`SecondaryFront` → `MainFront`, and `RouteFront` → `MainFront`. **Suggest from MTU** only checks side and rear elements when those signs show something different from the front in some messages.
+
+Listing text follows IPS conventions: `^` separates frames and `÷` separates lines within a frame. Compiled `MessageFrames` remain authoritative; the element choice only affects how messages are organized for editing in IPS.
 
 ## Verification
 

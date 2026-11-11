@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Build an editable Luminator IPS .ips database from a compiled .mtu.
 
-Windows writer paired with mtu_reverse.py. It auto-detects both legacy
-Class-C Route/Destination/SmallSide and expanded five-field Class-C projects.  Parsing/reconstruction is
+Windows writer paired with mtu_reverse.py.  Class C authoring elements
+(RouteFront, MainFront, SecondaryFront, RouteSide, MainSide, RouteRear) are
+chosen by the user or suggested from the MTU; see class_c_elements.py.  Parsing/reconstruction is
 platform-independent; writing the old Microsoft Jet database is deliberately
 performed through Microsoft's DAO engine on Windows instead of manufacturing
 Jet pages by hand.
@@ -32,6 +33,7 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
+import class_c_elements as cce
 import mtu_reverse as mr
 
 
@@ -95,8 +97,9 @@ def donor_load_module_binding(db, metadata: dict) -> dict:
         "recovery will not substitute a different module, even in best-effort mode.")
 
 
-def build_model(mtu_path: Path, class_c_profile: str = "auto",
+def build_model(mtu_path: Path, class_c_layout: cce.ClassCLayout | None = None,
                 best_effort: bool = False) -> dict:
+    """Decode an MTU.  ``class_c_layout=None`` suggests elements from the MTU."""
     raw = mtu_path.read_bytes()
     mtu = mr.MTU(raw)
 
@@ -125,9 +128,11 @@ def build_model(mtu_path: Path, class_c_profile: str = "auto",
     resources = mr.reconstruct_resource_tables(
         raw, mtu, fheaders, gheaders, frames, sign_tables)
     zones = mr.reconstruct_effect_zones(frames, sign_tables)
-    resolved_profile = (mr.infer_class_c_profile(sign_tables) if (class_c_profile or "auto").lower() == "auto"
-                        else (class_c_profile or "expanded").lower())
-    db_frames = mr.database_ready_messageframes(frames, resources, sign_tables, resolved_profile)
+    if class_c_layout is None:
+        class_c_layout = cce.suggest_layout(frames, sign_tables)
+    class_c = cce.decode_class_c(frames, sign_tables, class_c_layout)
+    db_frames = mr.database_ready_messageframes(
+        frames, resources, {ordinal: class_c.element_id(ordinal) for ordinal in class_c.element_of})
 
     return {
         "raw_mtu": raw,
@@ -140,7 +145,8 @@ def build_model(mtu_path: Path, class_c_profile: str = "auto",
         "effect_zones": zones,
         "color_zones": color_zones,
         "db_frames": db_frames,
-        "class_c_profile": resolved_profile,
+        "class_c_layout": class_c_layout,
+        "class_c": class_c,
         "best_effort": best_effort,
         "compilation_metadata": compilation_metadata(mtu),
     }
@@ -344,7 +350,8 @@ def preflight_model(model: dict, known_font_ids: set[int] | None = None) -> dict
         "recovery_mode": "best_effort" if best_effort else "strict",
         "recovery_anomalies": recovery_anomalies,
         "mtu_sha256":hashlib.sha256(model["raw_mtu"]).hexdigest(),
-        "class_c_profile":model.get("class_c_profile","auto"),
+        "class_c_layout": model["class_c_layout"].describe() if model.get("class_c_layout") else None,
+        "class_c_element_usage": dict(model["class_c"].usage) if model.get("class_c") else {},
         "compilation_metadata": model.get("compilation_metadata"),
         "load_module_binding": model.get("load_module_binding"),
     }
@@ -408,8 +415,7 @@ def class_message_rows(model: dict) -> dict[str, list[dict]]:
         )
 
     out = {"ClassAMsgs": [], "ClassBMsgs": [], "ClassCMsgs": []}
-    profile=model.get("class_c_profile","expanded")
-    cc_by_code = {int(r["MsgCode"]): r for r in mr.reconstruct_class_c_by_profile(frames, model["sign_tables"], profile)}
+    class_c = model["class_c"]
     for (cls, code), rows in sorted(by_msg.items()):
         if cls == 1:
             out["ClassAMsgs"].append({
@@ -425,52 +431,12 @@ def class_message_rows(model: dict) -> dict[str, list[dict]]:
                 "PRSide": "", "IDPRSide": 19,
             })
         elif cls == 3:
-            recovered = dict(cc_by_code[int(code)])
-            if profile == "legacy":
-                for key in ("Route","Destination","SmallSide"):
-                    recovered[key]=str(recovered.get(key,""))[:255]
-            else:
-                # Retain the donor's old Destination pair as a compatibility
-                # summary while the five expanded fields remain authoritative.
-                recovered["Destination"] = recovered.get("DestinationTop", "")[:255]
-                recovered["IDDestination"] = 7
-                for key in ("Route", "DestinationTop", "DestinationBot", "DestinationSide", "RouteSide"):
-                    recovered[key] = str(recovered.get(key, ""))[:255]
-            out["ClassCMsgs"].append(recovered)
-    return out
-
-
-def class_message_element_rows(classes: dict[str, list[dict]], profile: str) -> list[dict]:
-    """Normalize authoring fields into the compiler's ClassMsgs element table."""
-    if profile == "legacy":
-        class_c_fields = (("Route", "IDRoute"), ("Destination", "IDDestination"),
-                          ("SmallSide", "IDSmallSide"))
-    else:
-        class_c_fields = (("Route", "IDRoute"), ("DestinationTop", "IDDestinationTop"),
-                          ("DestinationBot", "IDDestinationBot"),
-                          ("DestinationSide", "IDDestinationSide"),
-                          ("RouteSide", "IDRouteSide"))
-    field_map = {
-        "ClassAMsgs": (("Title", "IDTitle"), ("Text", "IDText")),
-        "ClassBMsgs": (("PRText", "IDPRText"), ("PRBot", "IDPRBot"),
-                        ("PRSide", "IDPRSide")),
-        "ClassCMsgs": class_c_fields,
-    }
-    out = []
-    for table, fields in field_map.items():
-        for row in classes.get(table, []):
-            for text_field, id_field in fields:
-                text = str(row.get(text_field) or "")
-                element_id = row.get(id_field)
-                if not text or element_id is None:
-                    continue
-                out.append({
-                    "MsgCode": int(row["MsgCode"]),
-                    "MsgClassID": int(row["MsgClassID"]),
-                    "ElementID": int(element_id),
-                    "ElementText": text,
-                    "Approved": bool(row.get("Approved", True)),
-                })
+            row = {"MsgCode": code, "MsgClassID": 3, "Approved": True}
+            listing = class_c.listings.get(int(code), {})
+            for name in class_c.layout.elements:
+                row[name] = listing.get(name, "")[:255]
+                row["ID" + name] = cce.ELEMENT_IDS[name]
+            out["ClassCMsgs"].append(row)
     return out
 
 
@@ -748,7 +714,7 @@ def _fit_field_value(value, info: tuple[int, int, bool, bool] | None):
 
     * Text is truncated to its declared maximum.
     * ``""`` becomes NULL when ``AllowZeroLength`` is false.  Native IPS
-      Class-C columns allow zero-length strings (see _ensure_class_c_fields).
+      Class C columns allow zero-length strings (see _ensure_class_c_fields).
     Binary/OLE values are never truncated here.
     """
     if value is None or info is None:
@@ -1085,130 +1051,62 @@ def remap_dependent_rows(model: dict, maps: dict[str, dict[int,int]], signset_id
     }
 
 
-def _ensure_class_c_fields(tdf, defs) -> set[str]:
-    """Append missing ClassCMsgs columns and return the resulting field names.
+CLASS_C_KEY_FIELDS = ("MsgCode", "MsgClassID", "Approved")
 
-    Native IPS stores unused Class-C text elements as zero-length strings and
-    its compiler reads them without Null checks ("fcplcmdCompile: Invalid use of
-    Null").  DAO's CreateField defaults AllowZeroLength to False, which would
-    make the writer coerce "" to NULL, so text columns must explicitly allow it.
+
+def ensure_class_c_schema(db, layout: cce.ClassCLayout) -> None:
+    """Make ClassCMsgs hold exactly the chosen elements (text + ID column each).
+
+    Native IPS adds an element's columns when the element is created and drops
+    them when it is deleted, so stale donor columns (e.g. Route/Destination when
+    they are not chosen) are removed.  Text columns must allow zero-length
+    strings: IPS's compiler reads them without Null checks ("Invalid use of Null").
     """
+    others = {}
+    rs = db.OpenRecordset("SELECT ElementID, ElementName FROM MsgClassElements WHERE MsgClassID <> 3", 4)
+    try:
+        while not rs.EOF:
+            others[int(rs.Fields("ElementID").Value)] = str(rs.Fields("ElementName").Value)
+            rs.MoveNext()
+    finally:
+        rs.Close()
+    clashes = [f"{name} ({cce.ELEMENT_IDS[name]} is {others[cce.ELEMENT_IDS[name]]})"
+               for name in layout.elements if cce.ELEMENT_IDS[name] in others]
+    if clashes:
+        raise RuntimeError("Donor MsgClassElements already uses the Class C element ID(s): " + ", ".join(clashes))
+
+    tdf = db.TableDefs("ClassCMsgs")
+    wanted = {}
+    for name in layout.elements:
+        wanted[name] = 10
+        wanted["ID" + name] = 4
     existing = {str(tdf.Fields(i).Name) for i in range(tdf.Fields.Count)}
-    for name, dtype, size in defs:
+    for name in sorted(existing - set(wanted) - set(CLASS_C_KEY_FIELDS)):
+        tdf.Fields.Delete(name)
+    for name, dtype in wanted.items():
         if name in existing:
             fld = tdf.Fields(name)
             if dtype == 10 and int(fld.Type) == 10 and not bool(fld.AllowZeroLength):
                 fld.AllowZeroLength = True
             continue
-        fld = tdf.CreateField(name, dtype, size) if size else tdf.CreateField(name, dtype)
+        fld = tdf.CreateField(name, dtype, 255) if dtype == 10 else tdf.CreateField(name, dtype)
         if dtype == 10:
             fld.AllowZeroLength = True
         tdf.Fields.Append(fld)
-        existing.add(name)
-    return existing
-
-
-def ensure_legacy_class_c_schema(db) -> None:
-    """Upgrade the blank donor to legacy Route/Destination/SmallSide shape."""
-    tdf=db.TableDefs("ClassCMsgs")
-    existing=_ensure_class_c_fields(tdf, (("SmallSide",10,255),("IDSmallSide",4,None)))
-    missing={"SmallSide","IDSmallSide"}-existing
-    if missing:raise RuntimeError("Could not add legacy ClassC fields: "+", ".join(sorted(missing)))
-
-
-def ensure_expanded_class_c_schema(db) -> None:
-    """Upgrade an old Donor.ips ClassCMsgs table to the five-field IPS layout.
-
-    The stock blank donor has Route + Destination.  Newer projects may also use
-    DestinationTop, DestinationBot, DestinationSide and RouteSide.  Adding these
-    authoring columns is non-destructive; the legacy Destination pair is retained.
-    """
-    tdf = db.TableDefs("ClassCMsgs")
-    # DAO DataTypeEnum: dbLong=4, dbText=10.
-    defs = [
-        ("DestinationTop", 10, 255), ("IDDestinationTop", 4, None),
-        ("DestinationBot", 10, 255), ("IDDestinationBot", 4, None),
-        ("DestinationSide", 10, 255), ("IDDestinationSide", 4, None),
-        ("RouteSide", 10, 255), ("IDRouteSide", 4, None),
-    ]
-    existing = _ensure_class_c_fields(tdf, defs)
-    required = {x[0] for x in defs}
-    missing = required - existing
+    tdf.Fields.Refresh()
+    missing = set(wanted) - {str(tdf.Fields(i).Name) for i in range(tdf.Fields.Count)}
     if missing:
-        raise RuntimeError("Could not expand ClassCMsgs schema: missing " + ", ".join(sorted(missing)))
+        raise RuntimeError("Could not configure ClassCMsgs columns: " + ", ".join(sorted(missing)))
 
 
-def ensure_class_message_element_key(db) -> None:
-    """Allow one ClassMsgs row for each authoring element of a message."""
-    tdf = db.TableDefs("ClassMsgs")
-    key_fields = ("MsgCode", "MsgClassID", "ElementID")
-    restrictive = []
-    for index in range(tdf.Indexes.Count):
-        idx = tdf.Indexes(index)
-        fields = tuple(str(idx.Fields(field_index).Name) for field_index in range(idx.Fields.Count))
-        if bool(idx.Primary) and fields == key_fields:
-            return
-        if bool(idx.Primary) and fields == key_fields[:2]:
-            restrictive.append(str(idx.Name))
-    for name in restrictive:
-        tdf.Indexes.Delete(name)
-    if restrictive:
-        index = tdf.CreateIndex("PrimaryKey")
-        index.Primary = True
-        index.Unique = True
-        for field_name in key_fields:
-            index.Fields.Append(index.CreateField(field_name))
-        tdf.Indexes.Append(index)
-    else:
-        raise RuntimeError("ClassMsgs primary key does not match a supported donor schema")
-
-
-def adapt_to_donor_schema(db, dep: dict, classes: dict, profile: str) -> None:
-    fields=table_fields(db,"ClassCMsgs")
-    if profile=="legacy":
-        required={"Route","IDRoute","Destination","IDDestination","SmallSide","IDSmallSide"}
-    else:
-        required={"DestinationTop","IDDestinationTop","DestinationBot","IDDestinationBot",
-                  "DestinationSide","IDDestinationSide","RouteSide","IDRouteSide"}
-    missing=required-fields
-    if missing:
-        raise RuntimeError(f"{profile} ClassCMsgs schema is unavailable: "+", ".join(sorted(missing)))
-
-
-def class_c_metadata_rows(profile: str) -> tuple[list[dict], list[tuple[str, int]]]:
-    if profile == "expanded":
-        return (
-            [
-                {"ElementID": 6, "MsgClassID": 3, "ElementName": "Route", "ElementDescription": "Route number"},
-                {"ElementID": 14, "MsgClassID": 3, "ElementName": "DestinationTop", "ElementDescription": "Top destination"},
-                {"ElementID": 15, "MsgClassID": 3, "ElementName": "DestinationBot", "ElementDescription": "Bottom destination"},
-                {"ElementID": 16, "MsgClassID": 3, "ElementName": "DestinationSide", "ElementDescription": "Side destination"},
-                {"ElementID": 17, "MsgClassID": 3, "ElementName": "RouteSide", "ElementDescription": "Side route"},
-            ],
-            [("MsgCode", 900), ("Locked", 700), ("Route", 1500),
-             ("DestinationTop", 3000), ("DestinationBot", 3000),
-             ("DestinationSide", 3000), ("RouteSide", 1500)],
-        )
-    return (
-        [
-            {"ElementID": 6, "MsgClassID": 3, "ElementName": "Route", "ElementDescription": "Route number"},
-            {"ElementID": 7, "MsgClassID": 3, "ElementName": "Destination", "ElementDescription": "Destination"},
-            {"ElementID": 14, "MsgClassID": 3, "ElementName": "SmallSide", "ElementDescription": "Small side destination"},
-        ],
-        [("MsgCode", 900), ("Locked", 700), ("Route", 3000),
-         ("Destination", 3000), ("SmallSide", 3000)],
-    )
-
-
-def configure_class_c_metadata(db, profile: str, row_callback=None) -> None:
-    elements, columns = class_c_metadata_rows(profile)
+def configure_class_c_metadata(db, layout: cce.ClassCLayout, row_callback=None) -> None:
     db.Execute("DELETE FROM [MsgClassElements] WHERE [MsgClassID] = 3")
     db.Execute("DELETE FROM [MsgListingElements] WHERE [MsgClassID] = 3")
-    append_rows(db, "MsgClassElements", elements, row_callback=row_callback)
+    append_rows(db, "MsgClassElements", layout.element_rows(), row_callback=row_callback)
     next_col_id = max_value(db, "MsgListingElements", "ColID") + 1
     listing_rows = [
         {"ColID": next_col_id + index, "MsgClassID": 3, "ColName": name, "ColWidth": width}
-        for index, (name, width) in enumerate(columns)
+        for index, (name, width) in enumerate(layout.listing_columns())
     ]
     append_rows(db, "MsgListingElements", listing_rows, row_callback=row_callback)
 
@@ -1256,8 +1154,7 @@ def verify_written_database(db, model: dict) -> dict:
     expected["ClassAMsgs"]=sum(1 for c,_ in pairs if c==1)
     expected["ClassBMsgs"]=sum(1 for c,_ in pairs if c==2)
     expected["ClassCMsgs"]=sum(1 for c,_ in pairs if c==3)
-    expected["ClassMsgs"]=len(class_message_element_rows(
-        class_message_rows(model), model.get("class_c_profile", "expanded")))
+    expected["ClassMsgs"]=0
     if "graphic_recovery" in model:
         expected["Graphics"] = model["graphic_recovery"]["expected_graphics"]
     actual={}
@@ -1368,7 +1265,7 @@ def verify_written_database(db, model: dict) -> dict:
 
 
 def build_ips(mtu_path: Path, template_path: Path, out_path: Path, project_name: str,
-              class_c_profile: str = "auto", progress_callback=None,
+              class_c_layout: cce.ClassCLayout | None = None, progress_callback=None,
               best_effort: bool = False):
     def report_progress(percent: int, message: str) -> None:
         if progress_callback is not None:
@@ -1377,7 +1274,7 @@ def build_ips(mtu_path: Path, template_path: Path, out_path: Path, project_name:
     if template_path.resolve() == out_path.resolve():
         raise ValueError("Output path must differ from the template")
     report_progress(5, "Reading and decoding MTU...")
-    model=build_model(mtu_path, class_c_profile, best_effort=best_effort)
+    model=build_model(mtu_path, class_c_layout, best_effort=best_effort)
     report_progress(30, "Validating recovered model...")
     preflight=preflight_model(model)
     if preflight["status"] != "PASS":
@@ -1400,12 +1297,8 @@ def build_ips(mtu_path: Path, template_path: Path, out_path: Path, project_name:
         model["sign_catalog"] = apply_sign_catalog(model["sign_tables"], catalog, catalog_warnings)
         preflight = preflight_model(model)
         classes=class_message_rows(model)
-        class_elements=class_message_element_rows(classes, model["class_c_profile"])
-        if model["class_c_profile"]=="legacy":
-            ensure_legacy_class_c_schema(db)
-        else:
-            ensure_expanded_class_c_schema(db)
-        ensure_class_message_element_key(db)
+        layout=model["class_c_layout"]
+        ensure_class_c_schema(db, layout)
         ws.BeginTrans()
         try:
             # A blank Donor.ips database contains the required resource/schema objects
@@ -1436,7 +1329,6 @@ def build_ips(mtu_path: Path, template_path: Path, out_path: Path, project_name:
                 + len(missing_graphics),
             }
             message_pairs = {(int(row["MsgClassID"]), int(row["MsgCode"])) for row in model["db_frames"]}
-            metadata_elements, metadata_columns = class_c_metadata_rows(model["class_c_profile"])
             write_counts = [
                 ("Fonts", len(missing_fonts)), ("Graphics", len(missing_graphics)),
                 ("PhysicalSigns", len(base["PhysicalSigns"])), ("LogicalSigns", len(base["LogicalSigns"])),
@@ -1444,8 +1336,7 @@ def build_ips(mtu_path: Path, template_path: Path, out_path: Path, project_name:
                 ("SignSetBuild", len(model["sign_tables"]["SignSetBuild"])), ("EffectZones", len(model["effect_zones"])),
                 ("MessageFrames", len(model["db_frames"])), ("ColorZone", len(model.get("color_zones", []))),
                 ("SignMsgCodeProperties", len(message_pairs) * len(model["sign_tables"]["LogicalSigns"])),
-                ("Class-C metadata", len(metadata_elements) + len(metadata_columns)),
-                ("ClassMsgs", len(class_elements)),
+                ("Class C metadata", len(layout.element_rows()) + len(layout.listing_columns())),
                 *[(table, len(rows)) for table, rows in classes.items()],
             ]
             total_write_rows = sum(count for _, count in write_counts)
@@ -1461,7 +1352,7 @@ def build_ips(mtu_path: Path, template_path: Path, out_path: Path, project_name:
                     report_progress(percent, f"Writing {table}: {completed_write_rows:,}/{total_write_rows:,} rows...")
 
             report_progress(55, f"Writing recovered data: 0/{total_write_rows:,} rows...")
-            configure_class_c_metadata(db, model["class_c_profile"], report_written_row)
+            configure_class_c_metadata(db, layout, report_written_row)
             font_map.update(append_autonumber_rows(
                 db,"Fonts",missing_fonts,"FontID",blob_fields={"FontBlobHex":"Font"},
                 pythoncom=pythoncom,VARIANT=VARIANT,row_callback=report_written_row)
@@ -1487,7 +1378,6 @@ def build_ips(mtu_path: Path, template_path: Path, out_path: Path, project_name:
             dep=remap_dependent_rows(model,{
                 "FontID":font_map,"GraphicID":graph_map,"PSignID":p_map,"LSignID":l_map,
             },ss_map[1])
-            adapt_to_donor_schema(db, dep, classes, model["class_c_profile"])
             append_rows(db,"LogicalSignBuild",dep["LogicalSignBuild"],pythoncom=pythoncom,VARIANT=VARIANT,row_callback=report_written_row)
             append_rows(db,"SignSetBuild",dep["SignSetBuild"],pythoncom=pythoncom,VARIANT=VARIANT,row_callback=report_written_row)
             append_autonumber_rows(db,"EffectZones",dep["EffectZones"],"EffZoneID",
@@ -1498,7 +1388,6 @@ def build_ips(mtu_path: Path, template_path: Path, out_path: Path, project_name:
                                    pythoncom=pythoncom,VARIANT=VARIANT,row_callback=report_written_row)
             append_autonumber_rows(db,"SignMsgCodeProperties",dep["SignMsgCodeProperties"],"ID",
                                    pythoncom=pythoncom,VARIANT=VARIANT,row_callback=report_written_row)
-            append_rows(db,"ClassMsgs",class_elements,pythoncom=pythoncom,VARIANT=VARIANT,row_callback=report_written_row)
             for table,rows in classes.items():
                 append_rows(db,table,rows,pythoncom=pythoncom,VARIANT=VARIANT,row_callback=report_written_row)
             ws.CommitTrans()
@@ -1514,6 +1403,7 @@ def build_ips(mtu_path: Path, template_path: Path, out_path: Path, project_name:
         verification["graphic_recovery"] = model["graphic_recovery"]
         verification["compilation_metadata"] = model["compilation_metadata"]
         verification["load_module_binding"] = model["load_module_binding"]
+        verification["class_c_layout"] = layout.describe()
     finally:
         try:
             db.Close()
@@ -1528,26 +1418,31 @@ def build_ips(mtu_path: Path, template_path: Path, out_path: Path, project_name:
     return model, verification
 
 def main():
-    ap=argparse.ArgumentParser(description=__doc__)
+    ap=argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("mtu", type=Path)
     ap.add_argument("template", type=Path, help="donor IPS database; Donor.ips is included in releases")
     ap.add_argument("output", type=Path)
     ap.add_argument("--name", default="RECOVERED", help="new SignSetName")
-    ap.add_argument("--class-c-profile", choices=("auto","legacy","expanded"), default="auto",
-                    help="Class-C authoring schema; auto infers from compiled hardware")
+    ap.add_argument("--class-c-elements", default="auto", metavar="LIST",
+                    help="comma-separated Class C elements to create, from "
+                         + ", ".join(cce.ELEMENTS) + " (MainFront is required); "
+                         "'auto' suggests them from the MTU")
     ap.add_argument("--preflight-only", action="store_true", help="parse/validate MTU without opening DAO or writing an IPS")
     ap.add_argument("--best-effort", action="store_true",
                     help="preserve decoded anomalies with warnings; editable appearance is unverified")
     args=ap.parse_args()
+    layout=(None if args.class_c_elements.strip().lower()=="auto"
+            else cce.ClassCLayout.parse(args.class_c_elements))
     if args.preflight_only:
         report=preflight_model(build_model(
-            args.mtu,args.class_c_profile,best_effort=args.best_effort))
+            args.mtu,layout,best_effort=args.best_effort))
         print(json.dumps(report,indent=2))
         raise SystemExit(0 if report["status"]=="PASS" else 2)
-    _,verification=build_ips(
-        args.mtu,args.template,args.output,args.name,args.class_c_profile,
+    model,verification=build_ips(
+        args.mtu,args.template,args.output,args.name,layout,
         best_effort=args.best_effort)
     print(f"Wrote {args.output}")
+    print("Class C elements: " + ", ".join(model["class_c_layout"].elements))
     for warning in verification["warnings"]:
         print(f"WARNING: {warning}")
     print(f"Verification: {verification['status']} ({args.output}.verify.json)")

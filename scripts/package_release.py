@@ -19,6 +19,7 @@ APP_NAME = "Luminator-MTU-to-IPS"
 ENTRY_POINT = ROOT / "MTU_to_IPS_GUI.pyw"
 REQUIRED_SOURCES = (
     ROOT / "build_ips_windows.py",
+    ROOT / "class_c_elements.py",
     ROOT / "mtu_reverse.py",
     ROOT / "PROBE_DAO.vbs",
 )

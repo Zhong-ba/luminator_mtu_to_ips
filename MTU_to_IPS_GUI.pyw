@@ -19,7 +19,7 @@ HERE = (
 sys.path.insert(0, str(HERE))
 
 import build_ips_windows as builder
-import mtu_reverse as mr
+import class_c_elements as cce
 
 APP_TITLE = "Luminator MTU to IPS Converter"
 SETTINGS_DIR = Path(os.environ.get("APPDATA", Path.home())) / "LuminatorMTUtoIPS"
@@ -54,7 +54,10 @@ class ConverterUI(tk.Tk):
         self.out_var = tk.StringVar()
         self.donor_var = tk.StringVar(value=_default_donor())
         self.name_var = tk.StringVar(value="RECOVERED")
-        self.profile_var = tk.StringVar(value="Auto")
+        self._auto_output = ""
+        self._auto_name = "RECOVERED"
+        self.element_vars = {name: tk.BooleanVar(value=name in ("RouteFront", "MainFront"))
+                             for name in cce.ELEMENTS}
         self.status_var = tk.StringVar(value="Select an MTU file to begin.")
         self.open_folder_var = tk.BooleanVar(value=True)
         self.best_effort_var = tk.BooleanVar(value=False)
@@ -190,17 +193,20 @@ class ConverterUI(tk.Tk):
         ttk.Entry(inputs, textvariable=self.name_var, style="Converter.TEntry").grid(row=4, column=1, sticky="ew", pady=5)
         tk.Label(inputs, text="20 characters max", bg="#111827", fg="#94A3B8", font=("Segoe UI", 8)).grid(row=4, column=2, sticky="e", padx=(10, 0), pady=5)
 
-        tk.Label(inputs, text="Class-C schema", **label_options).grid(row=5, column=0, sticky="w", padx=(0, 12), pady=5)
-        profile = ttk.Combobox(
-            inputs,
-            textvariable=self.profile_var,
-            state="readonly",
-            style="Converter.TCombobox",
-            values=("Auto", "Legacy (Route / Destination / SmallSide)",
-                    "Expanded (Route / Top / Bottom / Side / RouteSide)"),
-        )
-        profile.grid(row=5, column=1, sticky="ew", pady=5)
-        tk.Label(inputs, text="Automatic", bg="#111827", fg="#94A3B8", font=("Segoe UI", 8)).grid(row=5, column=2, sticky="e", padx=(10, 0), pady=5)
+        tk.Label(inputs, text="Class C elements", **label_options).grid(row=5, column=0, sticky="nw", padx=(0, 12), pady=5)
+        elements_box = tk.Frame(inputs, bg="#111827")
+        elements_box.grid(row=5, column=1, sticky="ew", pady=5)
+        self.element_checks = {}
+        for index, name in enumerate(cce.ELEMENTS):
+            check = ttk.Checkbutton(
+                elements_box, text=name, variable=self.element_vars[name], style="Converter.TCheckbutton")
+            check.grid(row=index // 3, column=index % 3, sticky="w", padx=(0, 18), pady=1)
+            if name in cce.REQUIRED_ELEMENTS:
+                self.element_vars[name].set(True)
+                check.state(["disabled"])
+            self.element_checks[name] = check
+        self.suggest_btn = ttk.Button(inputs, text="Suggest from MTU", style="Converter.TButton", command=self._suggest_elements)
+        self.suggest_btn.grid(row=5, column=2, sticky="n", padx=(10, 0), pady=5)
 
         actions = tk.Frame(
             root,
@@ -304,11 +310,15 @@ class ConverterUI(tk.Tk):
             return
         self.mtu_var.set(fn)
         p = Path(fn)
-        if not self.out_var.get():
-            self.out_var.set(str(p.with_name(p.stem + "-RECOVERED.ips")))
-        if self.name_var.get() == "RECOVERED":
-            self.name_var.set(p.stem[:20])
+        # Keep following the selected MTU until the user edits these fields.
+        if self.out_var.get() in ("", self._auto_output):
+            self._auto_output = str(p.with_name(p.stem + "-RECOVERED.ips"))
+            self.out_var.set(self._auto_output)
+        if self.name_var.get() in ("", self._auto_name):
+            self._auto_name = p.stem[:20]
+            self.name_var.set(self._auto_name)
         self._append_log(f"Selected MTU: {p}")
+        self._suggest_elements()
 
     def _browse_output(self):
         initial = Path(self.out_var.get()).name if self.out_var.get() else "RECOVERED.ips"
@@ -348,6 +358,7 @@ class ConverterUI(tk.Tk):
         state = "disabled" if busy else "normal"
         self.preflight_btn.configure(state=state)
         self.convert_btn.configure(state=state)
+        self.suggest_btn.configure(state=state)
         self.best_effort_check.configure(state=state)
         if busy:
             self.progress_var.set(0)
@@ -391,13 +402,28 @@ class ConverterUI(tk.Tk):
             out.parent.mkdir(parents=True, exist_ok=True)
         return mtu, donor, out
 
-    def _profile_key(self):
-        v = self.profile_var.get()
-        if v.startswith("Legacy"):
-            return "legacy"
-        if v.startswith("Expanded"):
-            return "expanded"
-        return "auto"
+    def _class_c_layout(self) -> cce.ClassCLayout:
+        chosen = tuple(name for name in cce.ELEMENTS if self.element_vars[name].get())
+        return cce.ClassCLayout(chosen)
+
+    def _suggest_elements(self):
+        mtu_text = self.mtu_var.get().strip()
+        if not mtu_text or not Path(mtu_text).is_file():
+            messagebox.showerror(APP_TITLE, "Choose a valid .mtu input file first.")
+            return
+        mtu = Path(mtu_text)
+        best_effort = self.best_effort_var.get()
+
+        def work():
+            try:
+                self.events.put(("progress", (20, "Analysing Class C sign layouts...")))
+                model = builder.build_model(mtu, None, best_effort=best_effort)
+                self.events.put(("suggest_done", (model["class_c_layout"], dict(model["class_c"].usage),
+                                                  len(model["class_c"].listings))))
+            except Exception:
+                self.events.put(("error", traceback.format_exc()))
+
+        self._start_worker(work, "Suggesting Class C elements...")
 
     def _start_worker(self, target, status):
         if self.worker and self.worker.is_alive():
@@ -413,16 +439,16 @@ class ConverterUI(tk.Tk):
             messagebox.showerror(APP_TITLE, str(e))
             return
 
-        profile_key = self._profile_key()
+        layout = self._class_c_layout()
         best_effort = self.best_effort_var.get()
         donor_text = self.donor_var.get().strip()
         donor = Path(donor_text) if donor_text and Path(donor_text).is_file() else None
 
         def work():
             try:
-                self.events.put(("log", f"Preflight: {mtu.name}  (Class-C: {profile_key})"))
+                self.events.put(("log", f"Preflight: {mtu.name}  (Class C: {', '.join(layout.elements)})"))
                 self.events.put(("progress", (15, "Reading and decoding MTU...")))
-                model = builder.build_model(mtu, profile_key, best_effort=best_effort)
+                model = builder.build_model(mtu, layout, best_effort=best_effort)
                 self.events.put(("progress", (75, "Validating recovered model...")))
                 known_font_ids = None
                 if donor is not None:
@@ -460,7 +486,7 @@ class ConverterUI(tk.Tk):
             messagebox.showerror(APP_TITLE, str(e))
             return
         project_name = (self.name_var.get().strip() or "RECOVERED")[:20]
-        profile_key = self._profile_key()
+        layout = self._class_c_layout()
         best_effort = self.best_effort_var.get()
         if out.exists() and not messagebox.askyesno(APP_TITLE, f"Overwrite existing file?\n\n{out}"):
             return
@@ -470,17 +496,14 @@ class ConverterUI(tk.Tk):
                 self.events.put(("log", f"Converting: {mtu}"))
                 self.events.put(("log", f"Donor:     {donor}"))
                 self.events.put(("log", f"Output:    {out}"))
-                self.events.put(("log", f"Class-C:   {profile_key}"))
+                self.events.put(("log", f"Class C:   {', '.join(layout.elements)}"))
                 self.events.put(("log", f"Recovery:  {'best-effort (unverified appearance)' if best_effort else 'strict'}"))
                 model, verification = builder.build_ips(
-                    mtu, donor, out, project_name, profile_key,
+                    mtu, donor, out, project_name, layout,
                     lambda percent, status: self.events.put(("progress", (percent, status))),
                     best_effort=best_effort,
                 )
-                cc = mr.reconstruct_class_c_by_profile(
-                    model["frames"], model["sign_tables"], model["class_c_profile"]
-                )
-                verification["class_c_rows"] = len(cc)
+                verification["class_c_rows"] = len(model["class_c"].listings)
                 self.events.put(("convert_done", (out, verification)))
             except Exception:
                 self.events.put(("error", traceback.format_exc()))
@@ -493,6 +516,15 @@ class ConverterUI(tk.Tk):
                 kind, payload = self.events.get_nowait()
                 if kind == "log":
                     self._append_log(str(payload))
+                elif kind == "suggest_done":
+                    layout, usage, messages = payload
+                    for name, var in self.element_vars.items():
+                        var.set(name in layout.elements)
+                    self._append_log(
+                        "Suggested Class C elements: " + ", ".join(layout.elements)
+                        + f"\n  Messages needing each element (of {messages}): "
+                        + ", ".join(f"{name} {usage.get(name, 0)}" for name in cce.ELEMENTS))
+                    self._set_busy(False, "Class C elements suggested. Adjust the checkboxes if needed.")
                 elif kind == "progress":
                     percent, status = payload
                     self._set_progress(int(percent), str(status))
@@ -522,7 +554,7 @@ class ConverterUI(tk.Tk):
                         notify(
                             APP_TITLE,
                             ("Preflight passed with warnings.\n\n" if warnings else "Preflight passed.\n\n") +
-                            f"Class-C schema: {report.get('class_c_profile')}\n"
+                            f"Class C elements: {', '.join((report.get('class_c_layout') or {}).get('elements', []))}\n"
                             f"Messages: {report.get('message_pairs')}\n"
                             f"Messages by class: {class_text}\n"
                             f"Frame rows: {report.get('frame_rows')}\n"
@@ -675,7 +707,7 @@ class ConverterUI(tk.Tk):
         ttk.Label(
             root,
             text=("Reconstructs an editable IPS project from a compiled MTU. Supports both legacy "
-                  "Route / Destination / SmallSide and expanded five-field Class-C projects."),
+                  "Route / Destination / SmallSide and expanded five-field Class C projects."),
             wraplength=760,
         ).grid(row=1, column=0, columnspan=3, sticky="w", pady=(0, 14))
 
@@ -695,7 +727,7 @@ class ConverterUI(tk.Tk):
         ttk.Entry(root, textvariable=self.name_var).grid(row=5, column=1, sticky="ew", pady=5)
         ttk.Label(root, text="IPS stores max 20 chars").grid(row=5, column=2, sticky="e", padx=(8, 0), pady=5)
 
-        ttk.Label(root, text="Class-C schema:").grid(row=6, column=0, sticky="w", padx=(0, 8), pady=5)
+        ttk.Label(root, text="Class C schema:").grid(row=6, column=0, sticky="w", padx=(0, 8), pady=5)
         profile = ttk.Combobox(
             root,
             textvariable=self.profile_var,
@@ -854,7 +886,7 @@ class ConverterUI(tk.Tk):
 
         def work():
             try:
-                self.events.put(("log", f"Preflight: {mtu.name}  (Class-C: {profile_key})"))
+                self.events.put(("log", f"Preflight: {mtu.name}  (Class C: {profile_key})"))
                 model = builder.build_model(mtu, profile_key)
                 report = builder.preflight_model(model)
                 cc = mr.reconstruct_class_c_by_profile(
@@ -883,7 +915,7 @@ class ConverterUI(tk.Tk):
                 self.events.put(("log", f"Converting: {mtu}"))
                 self.events.put(("log", f"Donor:     {donor}"))
                 self.events.put(("log", f"Output:    {out}"))
-                self.events.put(("log", f"Class-C:   {profile_key}"))
+                self.events.put(("log", f"Class C:   {profile_key}"))
                 model, verification = builder.build_ips(mtu, donor, out, project_name, profile_key)
                 cc = mr.reconstruct_class_c_by_profile(
                     model["frames"], model["sign_tables"], model["class_c_profile"]
@@ -909,9 +941,9 @@ class ConverterUI(tk.Tk):
                         messagebox.showinfo(
                             APP_TITLE,
                             "Preflight passed.\n\n"
-                            f"Class-C schema: {report.get('class_c_profile')}\n"
+                            f"Class C schema: {report.get('class_c_profile')}\n"
                             f"Messages: {report.get('message_pairs')}\n"
-                            f"Class-C rows: {report.get('class_c_rows')}\n"
+                            f"Class C rows: {report.get('class_c_rows')}\n"
                             f"Frame rows: {report.get('frame_rows')}\n"
                             f"Fonts: {report.get('fonts')}\nGraphics: {report.get('graphics')}",
                         )
