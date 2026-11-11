@@ -14,10 +14,11 @@ Requirements on the Windows machine:
   * pywin32:  py -m pip install pywin32
 
 Usage:
-    py build_ips_windows.py input.mtu Donor.ips recovered.ips --name RECOVERED
+    py build_ips_windows.py input.mtu recovered.ips --name RECOVERED
 
-Donor.ips is the bundled Luminator IPS database because
-it is a plain Jet 3 donor with built-in resource libraries and no project rows.
+The bundled Donor.ips (a plain Jet 3 IPS database with the built-in resource
+libraries and controller modules but no project rows) is used automatically;
+--donor selects another one.
 """
 from __future__ import annotations
 
@@ -35,6 +36,19 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 import class_c_elements as cce
 import mtu_reverse as mr
+
+DONOR_FILENAME = "Donor.ips"
+
+
+def bundled_donor() -> Path | None:
+    """Locate the bundled donor: PyInstaller data dir, executable dir, then source dir."""
+    candidates = []
+    if getattr(sys, "_MEIPASS", None):
+        candidates.append(Path(sys._MEIPASS) / DONOR_FILENAME)
+    if getattr(sys, "frozen", False):
+        candidates.append(Path(sys.executable).resolve().parent / DONOR_FILENAME)
+    candidates.append(HERE / DONOR_FILENAME)
+    return next((path for path in candidates if path.is_file()), None)
 
 
 def _load_module_signature(blob: bytes) -> str | None:
@@ -86,6 +100,7 @@ def donor_load_module_binding(db, metadata: dict) -> dict:
                     "description": str(rs.Fields("LMDescription").Value or ""),
                     "donor_sha256": hashlib.sha256(blob).hexdigest(),
                     "signature": signature,
+                    "source": "donor",
                 }
             rs.MoveNext()
     finally:
@@ -93,11 +108,112 @@ def donor_load_module_binding(db, metadata: dict) -> dict:
     raise RuntimeError(
         "No compatible load module was found in the donor. The embedded module "
         f"contains {metadata['load_module_length']} bytes "
-        f"(signature {signature}). Use a donor containing the original controller module; "
-        "recovery will not substitute a different module, even in best-effort mode.")
+        f"(signature {signature}).")
 
 
-def build_model(mtu_path: Path, class_c_layout: cce.ClassCLayout | None = None,
+def ips_reference_databases(donor_path: Path) -> list[Path]:
+    """Other IPS databases to consult: beside the donor and the installed IPS."""
+    installed = Path(os.environ.get("SystemDrive", "C:") + "\\") / "Luminator" / "IPS"
+    candidates = [donor_path.parent / "IPS.ips", donor_path.parent / "IPS.mdb",
+                  installed / "IPS.ips", installed / "IPS.mdb"]
+    result, seen = [], {donor_path.resolve()}
+    for path in candidates:
+        resolved = path.resolve()
+        if resolved not in seen and path.is_file():
+            seen.add(resolved)
+            result.append(resolved)
+    return result
+
+
+def find_load_module(engine, paths: list[Path], signature: str) -> tuple[Path, str, bytes] | None:
+    """Look for a stored controller module with the MTU's signature."""
+    for path in paths:
+        try:
+            other = engine.OpenDatabase(str(path), False, True)
+        except Exception:
+            continue
+        try:
+            rs = other.OpenRecordset("SELECT LMDescription, LOD FROM [LoadModules]", 4)
+            try:
+                while not rs.EOF:
+                    blob = bytes(rs.Fields("LOD").Value or b"")
+                    if _load_module_signature(blob) == signature:
+                        return path, str(rs.Fields("LMDescription").Value or ""), blob
+                    rs.MoveNext()
+            finally:
+                rs.Close()
+        except Exception:
+            pass
+        finally:
+            other.Close()
+    return None
+
+
+def rebuilt_load_module(raw_mtu: bytes, mtu: mr.MTU) -> bytes:
+    """Recover the controller module from the copy every MTU starts with.
+
+    The compiler copies the module verbatim and patches only bytes 4-9 (payload
+    word count and checksum) and 508-509 (output version), which it rewrites on
+    every compile.  The count/checksum field is cleared; the version is kept.
+    """
+    module = bytearray(raw_mtu[:mtu.master_offset])
+    module[4:10] = bytes(6)
+    return bytes(module)
+
+
+def probe_load_module(engine, db, donor_path: Path, metadata: dict) -> dict:
+    """Report where ensure_load_module would take the module from, without writing."""
+    try:
+        return donor_load_module_binding(db, metadata)
+    except RuntimeError:
+        if metadata["load_module_signature"] is None:
+            raise
+    found = find_load_module(engine, ips_reference_databases(donor_path), metadata["load_module_signature"])
+    if found is not None:
+        return {"description": found[1], "signature": metadata["load_module_signature"],
+                "source": f"copied from {found[0]}"}
+    return {"description": f"(Recovered-{metadata['load_module_signature'][:8]}.lod)",
+            "signature": metadata["load_module_signature"], "source": "rebuilt from the MTU"}
+
+
+def ensure_load_module(engine, db, donor_path: Path, model: dict, pythoncom=None, VARIANT=None) -> dict:
+    """Bind the MTU's controller module, adding it to the output database if needed.
+
+    Order: the donor, then other local IPS databases (copied in), then the copy
+    embedded in the MTU itself.  A different module is never substituted.
+    """
+    metadata = model["compilation_metadata"]
+    try:
+        return donor_load_module_binding(db, metadata)
+    except RuntimeError:
+        if metadata["load_module_signature"] is None:
+            raise
+    found = find_load_module(engine, ips_reference_databases(donor_path), metadata["load_module_signature"])
+    if found is not None:
+        path, description, blob = found
+        source = f"copied from {path}"
+    else:
+        blob = rebuilt_load_module(model["raw_mtu"], model["mtu"])
+        description = f"(Recovered-{metadata['load_module_signature'][:8]}.lod)"
+        source = "rebuilt from the MTU"
+    rs = db.OpenRecordset("LoadModules", 2)
+    try:
+        rs.AddNew()
+        rs.Fields("LMDescription").Value = description[:80]
+        rs.Fields("LOD").AppendChunk(VARIANT(pythoncom.VT_ARRAY | pythoncom.VT_UI1, list(blob)))
+        rs.Update()
+        rs.Bookmark = rs.LastModified
+        load_mod_id = int(rs.Fields("LoadModID").Value)
+    finally:
+        rs.Close()
+    return {
+        "load_mod_id": load_mod_id, "description": description,
+        "donor_sha256": hashlib.sha256(blob).hexdigest(),
+        "signature": metadata["load_module_signature"], "source": source,
+    }
+
+
+def build_model(mtu_path: Path, class_c_layout: cce.ClassCLayout | cce.CustomLayout | None = None,
                 best_effort: bool = False) -> dict:
     """Decode an MTU.  ``class_c_layout=None`` suggests elements from the MTU."""
     raw = mtu_path.read_bytes()
@@ -435,7 +551,7 @@ def class_message_rows(model: dict) -> dict[str, list[dict]]:
             listing = class_c.listings.get(int(code), {})
             for name in class_c.layout.elements:
                 row[name] = listing.get(name, "")[:255]
-                row["ID" + name] = cce.ELEMENT_IDS[name]
+                row["ID" + name] = class_c.layout.element_id(name)
             out["ClassCMsgs"].append(row)
     return out
 
@@ -464,19 +580,9 @@ def read_sign_catalog(db, source: str) -> list[dict]:
 
 
 def load_sign_catalog(engine, donor_db, donor_path: Path) -> tuple[list[dict], list[str]]:
-    installed = Path(os.environ.get("SystemDrive", "C:") + "\\") / "Luminator" / "IPS"
-    candidates = [
-        donor_path.parent / "IPS.ips", donor_path.parent / "IPS.mdb",
-        installed / "IPS.ips", installed / "IPS.mdb",
-    ]
     rows = []
     warnings = []
-    seen = {donor_path.resolve()}
-    for path in candidates:
-        resolved = path.resolve()
-        if resolved in seen or not path.is_file():
-            continue
-        seen.add(resolved)
+    for resolved in ips_reference_databases(donor_path):
         try:
             catalog_db = engine.OpenDatabase(str(resolved), False, True)
             try:
@@ -484,7 +590,7 @@ def load_sign_catalog(engine, donor_db, donor_path: Path) -> tuple[list[dict], l
             finally:
                 catalog_db.Close()
         except Exception as error:
-            warnings.append(f"Could not read sign catalog {path}: {error}")
+            warnings.append(f"Could not read sign catalog {resolved}: {error}")
     rows.extend(read_sign_catalog(donor_db, str(donor_path.resolve())))
     return rows, warnings
 
@@ -1054,7 +1160,7 @@ def remap_dependent_rows(model: dict, maps: dict[str, dict[int,int]], signset_id
 CLASS_C_KEY_FIELDS = ("MsgCode", "MsgClassID", "Approved")
 
 
-def ensure_class_c_schema(db, layout: cce.ClassCLayout) -> None:
+def ensure_class_c_schema(db, layout: cce.ClassCLayout | cce.CustomLayout) -> None:
     """Make ClassCMsgs hold exactly the chosen elements (text + ID column each).
 
     Native IPS adds an element's columns when the element is created and drops
@@ -1070,8 +1176,8 @@ def ensure_class_c_schema(db, layout: cce.ClassCLayout) -> None:
             rs.MoveNext()
     finally:
         rs.Close()
-    clashes = [f"{name} ({cce.ELEMENT_IDS[name]} is {others[cce.ELEMENT_IDS[name]]})"
-               for name in layout.elements if cce.ELEMENT_IDS[name] in others]
+    clashes = [f"{name} ({layout.element_id(name)} is {others[layout.element_id(name)]})"
+               for name in layout.elements if layout.element_id(name) in others]
     if clashes:
         raise RuntimeError("Donor MsgClassElements already uses the Class C element ID(s): " + ", ".join(clashes))
 
@@ -1097,9 +1203,13 @@ def ensure_class_c_schema(db, layout: cce.ClassCLayout) -> None:
     missing = set(wanted) - {str(tdf.Fields(i).Name) for i in range(tdf.Fields.Count)}
     if missing:
         raise RuntimeError("Could not configure ClassCMsgs columns: " + ", ".join(sorted(missing)))
+    # Physical column order follows the element order, after the key fields.
+    for position, name in enumerate(list(CLASS_C_KEY_FIELDS) + list(wanted)):
+        tdf.Fields(name).OrdinalPosition = position
+    tdf.Fields.Refresh()
 
 
-def configure_class_c_metadata(db, layout: cce.ClassCLayout, row_callback=None) -> None:
+def configure_class_c_metadata(db, layout: cce.ClassCLayout | cce.CustomLayout, row_callback=None) -> None:
     db.Execute("DELETE FROM [MsgClassElements] WHERE [MsgClassID] = 3")
     db.Execute("DELETE FROM [MsgListingElements] WHERE [MsgClassID] = 3")
     append_rows(db, "MsgClassElements", layout.element_rows(), row_callback=row_callback)
@@ -1185,7 +1295,7 @@ def verify_written_database(db, model: dict) -> dict:
                 db, f"SELECT LOD FROM LoadModules WHERE LoadModID={binding['load_mod_id']}", "LOD")
             if (hashlib.sha256(module).hexdigest() != binding["donor_sha256"] or
                     _load_module_signature(module) != binding["signature"]):
-                errors.append("Selected load module differs from the matched donor module")
+                errors.append("Selected load module differs from the bound module")
         except Exception as e:
             errors.append(f"Could not verify compilation metadata: {e}")
     mtu_blob=b''
@@ -1265,7 +1375,7 @@ def verify_written_database(db, model: dict) -> dict:
 
 
 def build_ips(mtu_path: Path, template_path: Path, out_path: Path, project_name: str,
-              class_c_layout: cce.ClassCLayout | None = None, progress_callback=None,
+              class_c_layout: cce.ClassCLayout | cce.CustomLayout | None = None, progress_callback=None,
               best_effort: bool = False):
     def report_progress(percent: int, message: str) -> None:
         if progress_callback is not None:
@@ -1291,8 +1401,15 @@ def build_ips(mtu_path: Path, template_path: Path, out_path: Path, project_name:
     pythoncom, VARIANT, engine, db=open_dao(out_path, exclusive=True)
     ws=engine.Workspaces(0)
     try:
-        model["load_module_binding"] = donor_load_module_binding(
-            db, model["compilation_metadata"])
+        model["load_module_binding"] = ensure_load_module(
+            engine, db, template_path, model, pythoncom=pythoncom, VARIANT=VARIANT)
+        if model["load_module_binding"]["source"] != "donor":
+            message = (f"Controller module {model['load_module_binding']['description']} was "
+                       f"{model['load_module_binding']['source']}.")
+            if model["load_module_binding"]["source"] == "rebuilt from the MTU":
+                message += (" Its header fields are rewritten by IPS on compile; confirm the project "
+                            "compiles in IPS before relying on it.")
+            model["compilation_metadata"]["warnings"].append(message)
         catalog, catalog_warnings = load_sign_catalog(engine, db, template_path)
         model["sign_catalog"] = apply_sign_catalog(model["sign_tables"], catalog, catalog_warnings)
         preflight = preflight_model(model)
@@ -1419,27 +1536,44 @@ def build_ips(mtu_path: Path, template_path: Path, out_path: Path, project_name:
 
 def main():
     ap=argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("mtu", type=Path)
-    ap.add_argument("template", type=Path, help="donor IPS database; Donor.ips is included in releases")
-    ap.add_argument("output", type=Path)
+    ap.add_argument("paths", type=Path, nargs="+", metavar="PATH",
+                    help="input.mtu output.ips (the older input.mtu donor.ips output.ips form is still accepted)")
+    ap.add_argument("--donor", type=Path, help="donor IPS database; defaults to the bundled Donor.ips")
     ap.add_argument("--name", default="RECOVERED", help="new SignSetName")
     ap.add_argument("--class-c-elements", default="auto", metavar="LIST",
                     help="comma-separated Class C elements to create, from "
                          + ", ".join(cce.ELEMENTS) + " (MainFront is required); "
                          "'auto' suggests them from the MTU")
+    ap.add_argument("--class-c-preset", type=Path, metavar="JSON",
+                    help="custom Class C element names saved from the GUI's Custom elements dialog")
     ap.add_argument("--preflight-only", action="store_true", help="parse/validate MTU without opening DAO or writing an IPS")
     ap.add_argument("--best-effort", action="store_true",
                     help="preserve decoded anomalies with warnings; editable appearance is unverified")
     args=ap.parse_args()
-    layout=(None if args.class_c_elements.strip().lower()=="auto"
-            else cce.ClassCLayout.parse(args.class_c_elements))
+    if len(args.paths) == 2:
+        args.mtu, args.output = args.paths
+    elif len(args.paths) == 3 and not args.donor:
+        args.mtu, args.donor, args.output = args.paths
+    else:
+        ap.error("expected: input.mtu output.ips")
+    if not args.preflight_only:
+        args.donor = args.donor or bundled_donor()
+        if args.donor is None or not args.donor.is_file():
+            ap.error(f"{DONOR_FILENAME} was not found beside the converter; pass --donor PATH")
+    if args.class_c_preset and args.class_c_elements.strip().lower()!="auto":
+        ap.error("--class-c-preset and --class-c-elements cannot be combined")
+    if args.class_c_preset:
+        layout=cce.load_preset(args.class_c_preset)
+    else:
+        layout=(None if args.class_c_elements.strip().lower()=="auto"
+                else cce.ClassCLayout.parse(args.class_c_elements))
     if args.preflight_only:
         report=preflight_model(build_model(
             args.mtu,layout,best_effort=args.best_effort))
         print(json.dumps(report,indent=2))
         raise SystemExit(0 if report["status"]=="PASS" else 2)
     model,verification=build_ips(
-        args.mtu,args.template,args.output,args.name,layout,
+        args.mtu,args.donor,args.output,args.name,layout,
         best_effort=args.best_effort)
     print(f"Wrote {args.output}")
     print("Class C elements: " + ", ".join(model["class_c_layout"].elements))

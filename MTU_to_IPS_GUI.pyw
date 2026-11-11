@@ -27,10 +27,10 @@ SETTINGS_FILE = SETTINGS_DIR / "settings.json"
 
 
 def _default_donor() -> str:
-    candidates = [HERE / "Donor.ips"]
-    for candidate in candidates:
-        if candidate.is_file():
-            return str(candidate)
+    """The bundled Donor.ips, else one the user located earlier."""
+    bundled = builder.bundled_donor()
+    if bundled is not None:
+        return str(bundled)
     try:
         data = json.loads(SETTINGS_FILE.read_text(encoding="utf-8"))
         donor = Path(data.get("donor", ""))
@@ -58,6 +58,8 @@ class ConverterUI(tk.Tk):
         self._auto_name = "RECOVERED"
         self.element_vars = {name: tk.BooleanVar(value=name in ("RouteFront", "MainFront"))
                              for name in cce.ELEMENTS}
+        self.custom_layout: cce.CustomLayout | None = None
+        self.custom_var = tk.StringVar(value="")
         self.status_var = tk.StringVar(value="Select an MTU file to begin.")
         self.open_folder_var = tk.BooleanVar(value=True)
         self.best_effort_var = tk.BooleanVar(value=False)
@@ -78,6 +80,7 @@ class ConverterUI(tk.Tk):
             bordercolor="#334155",
             lightcolor="#334155",
             darkcolor="#334155",
+            insertcolor="#F8FAFC",
             padding=(10, 8),
         )
         style.map("Converter.TEntry", bordercolor=[("focus", "#3B82F6")])
@@ -88,6 +91,7 @@ class ConverterUI(tk.Tk):
             foreground="#F8FAFC",
             arrowcolor="#CBD5E1",
             bordercolor="#334155",
+            insertcolor="#F8FAFC",
             padding=(8, 6),
         )
         style.map(
@@ -185,15 +189,12 @@ class ConverterUI(tk.Tk):
         ttk.Entry(inputs, textvariable=self.out_var, style="Converter.TEntry").grid(row=2, column=1, sticky="ew", pady=5)
         ttk.Button(inputs, text="Save As", style="Converter.TButton", command=self._browse_output).grid(row=2, column=2, padx=(10, 0), pady=5)
 
-        tk.Label(inputs, text="Donor IPS", **label_options).grid(row=3, column=0, sticky="w", padx=(0, 12), pady=5)
-        ttk.Entry(inputs, textvariable=self.donor_var, style="Converter.TEntry").grid(row=3, column=1, sticky="ew", pady=5)
-        ttk.Button(inputs, text="Browse", style="Converter.TButton", command=self._browse_donor).grid(row=3, column=2, padx=(10, 0), pady=5)
 
-        tk.Label(inputs, text="Project name", **label_options).grid(row=4, column=0, sticky="w", padx=(0, 12), pady=5)
+        tk.Label(inputs, text="Project Name", **label_options).grid(row=4, column=0, sticky="w", padx=(0, 12), pady=5)
         ttk.Entry(inputs, textvariable=self.name_var, style="Converter.TEntry").grid(row=4, column=1, sticky="ew", pady=5)
         tk.Label(inputs, text="20 characters max", bg="#111827", fg="#94A3B8", font=("Segoe UI", 8)).grid(row=4, column=2, sticky="e", padx=(10, 0), pady=5)
 
-        tk.Label(inputs, text="Class C elements", **label_options).grid(row=5, column=0, sticky="nw", padx=(0, 12), pady=5)
+        tk.Label(inputs, text="Class C Elements", **label_options).grid(row=5, column=0, sticky="nw", padx=(0, 12), pady=5)
         elements_box = tk.Frame(inputs, bg="#111827")
         elements_box.grid(row=5, column=1, sticky="ew", pady=5)
         self.element_checks = {}
@@ -206,7 +207,11 @@ class ConverterUI(tk.Tk):
                 check.state(["disabled"])
             self.element_checks[name] = check
         self.suggest_btn = ttk.Button(inputs, text="Suggest from MTU", style="Converter.TButton", command=self._suggest_elements)
-        self.suggest_btn.grid(row=5, column=2, sticky="n", padx=(10, 0), pady=5)
+        self.suggest_btn.grid(row=5, column=2, sticky="new", padx=(10, 0), pady=5)
+        self.custom_btn = ttk.Button(inputs, text="Custom...", style="Converter.TButton", command=self._open_custom_elements)
+        self.custom_btn.grid(row=6, column=2, sticky="new", padx=(10, 0), pady=(0, 5))
+        tk.Label(inputs, textvariable=self.custom_var, bg="#111827", fg="#93C5FD", font=("Segoe UI", 9),
+                 anchor="w", justify="left", wraplength=520).grid(row=6, column=1, sticky="w", pady=(0, 5))
 
         actions = tk.Frame(
             root,
@@ -224,14 +229,14 @@ class ConverterUI(tk.Tk):
         self.convert_btn.grid(row=0, column=1, padx=(0, 8))
         ttk.Checkbutton(
             actions,
-            text="Open output folder when finished",
+            text="Open Output Folder When Finished",
             variable=self.open_folder_var,
             style="Converter.TCheckbutton",
         ).grid(row=0, column=2, sticky="w")
 
         self.best_effort_check = ttk.Checkbutton(
             actions,
-            text="Best-effort anomaly recovery (editable appearance is unverified)",
+            text="Best-Effort Anomaly Recovery (editable appearance is unverified)",
             variable=self.best_effort_var,
             style="Converter.TCheckbutton",
         )
@@ -303,7 +308,7 @@ class ConverterUI(tk.Tk):
 
     def _browse_mtu(self):
         fn = filedialog.askopenfilename(
-            title="Select compiled MTU",
+            title="Select Compiled MTU",
             filetypes=[("Luminator MTU", "*.mtu"), ("All files", "*.*")],
         )
         if not fn:
@@ -318,12 +323,13 @@ class ConverterUI(tk.Tk):
             self._auto_name = p.stem[:20]
             self.name_var.set(self._auto_name)
         self._append_log(f"Selected MTU: {p}")
-        self._suggest_elements()
+        if self.custom_layout is None:
+            self._suggest_elements()
 
     def _browse_output(self):
         initial = Path(self.out_var.get()).name if self.out_var.get() else "RECOVERED.ips"
         fn = filedialog.asksaveasfilename(
-            title="Save recovered IPS",
+            title="Save Recovered IPS",
             defaultextension=".ips",
             initialfile=initial,
             filetypes=[("Luminator IPS", "*.ips"), ("All files", "*.*")],
@@ -333,7 +339,7 @@ class ConverterUI(tk.Tk):
 
     def _browse_donor(self):
         fn = filedialog.askopenfilename(
-            title="Select a blank/donor Luminator IPS database (Donor.ips included)",
+            title="Locate Donor.ips",
             filetypes=[("Luminator IPS / Access donor", "*.ips *.mdb"), ("All files", "*.*")],
         )
         if fn:
@@ -359,6 +365,7 @@ class ConverterUI(tk.Tk):
         self.preflight_btn.configure(state=state)
         self.convert_btn.configure(state=state)
         self.suggest_btn.configure(state=state)
+        self.custom_btn.configure(state=state)
         self.best_effort_check.configure(state=state)
         if busy:
             self.progress_var.set(0)
@@ -381,14 +388,14 @@ class ConverterUI(tk.Tk):
             if donor is None or not donor.is_file():
                 if messagebox.askyesno(
                     APP_TITLE,
-                    "A donor IPS database is required to write the recovered project.\n\n"
-                    "Donor.ips is included with this converter.\n\nSelect it now?",
+                    "Donor.ips, the blank IPS database the recovered project is built from, "
+                    "was not found beside the converter.\n\nLocate it now?",
                 ):
                     self._browse_donor()
                     donor_text = self.donor_var.get().strip()
                     donor = Path(donor_text) if donor_text else None
             if donor is None or not donor.is_file():
-                raise ValueError("Choose a valid donor .ips/.mdb file (Donor.ips is included).")
+                raise ValueError("Donor.ips is required to write the recovered project.")
             self._save_donor_setting(donor)
 
         out = Path(self.out_var.get().strip()) if need_output else None
@@ -402,9 +409,39 @@ class ConverterUI(tk.Tk):
             out.parent.mkdir(parents=True, exist_ok=True)
         return mtu, donor, out
 
-    def _class_c_layout(self) -> cce.ClassCLayout:
+    def _class_c_layout(self) -> cce.ClassCLayout | cce.CustomLayout:
+        if self.custom_layout is not None:
+            return self.custom_layout
         chosen = tuple(name for name in cce.ELEMENTS if self.element_vars[name].get())
         return cce.ClassCLayout(chosen)
+
+    def _set_custom_layout(self, layout: cce.CustomLayout | None):
+        self.custom_layout = layout
+        for name, check in self.element_checks.items():
+            if name not in cce.REQUIRED_ELEMENTS:
+                check.state(["disabled"] if layout is not None else ["!disabled"])
+        self.custom_var.set("Custom elements: " + ", ".join(layout.elements) if layout is not None else "")
+        if layout is not None:
+            self._append_log("Using custom Class C elements: " + ", ".join(layout.elements))
+
+    def _open_custom_elements(self):
+        mtu_text = self.mtu_var.get().strip()
+        if not mtu_text or not Path(mtu_text).is_file():
+            messagebox.showerror(APP_TITLE, "Choose a valid .mtu input file first.")
+            return
+        mtu = Path(mtu_text)
+        best_effort = self.best_effort_var.get()
+
+        def work():
+            try:
+                self.events.put(("progress", (20, "Grouping Class C text by role and sign...")))
+                model = builder.build_model(mtu, cce.ClassCLayout(cce.ELEMENTS), best_effort=best_effort)
+                groups = cce.analyze_groups(model["frames"], model["sign_tables"])
+                self.events.put(("groups_done", groups))
+            except Exception:
+                self.events.put(("error", traceback.format_exc()))
+
+        self._start_worker(work, "Analysing Class C groups...")
 
     def _suggest_elements(self):
         mtu_text = self.mtu_var.get().strip()
@@ -456,8 +493,12 @@ class ConverterUI(tk.Tk):
                         pythoncom, _, engine, db = builder.open_dao(donor)
                         try:
                             try:
-                                model["load_module_binding"] = builder.donor_load_module_binding(
-                                    db, model["compilation_metadata"])
+                                binding = builder.probe_load_module(
+                                    engine, db, donor, model["compilation_metadata"])
+                                model["load_module_binding"] = binding
+                                if binding["source"] != "donor":
+                                    model["compilation_metadata"]["warnings"].append(
+                                        f"Controller module {binding['description']} will be {binding['source']}.")
                             except RuntimeError as error:
                                 model["load_module_error"] = str(error)
                             catalog, catalog_warnings = builder.load_sign_catalog(engine, db, donor)
@@ -470,6 +511,8 @@ class ConverterUI(tk.Tk):
                             pythoncom.CoUninitialize()
                     except Exception as error:
                         self.events.put(("log", f"Load-module/sign/font comparison unavailable: {error}"))
+                else:
+                    self.events.put(("log", "Donor.ips not found; load-module/sign/font comparison skipped."))
                 report = builder.preflight_model(
                     model, set(known_font_ids) if known_font_ids is not None else None)
                 self.events.put(("progress", (100, "Preflight complete.")))
@@ -518,6 +561,8 @@ class ConverterUI(tk.Tk):
                     self._append_log(str(payload))
                 elif kind == "suggest_done":
                     layout, usage, messages = payload
+                    if self.custom_layout is not None:
+                        self._set_custom_layout(None)
                     for name, var in self.element_vars.items():
                         var.set(name in layout.elements)
                     self._append_log(
@@ -525,6 +570,16 @@ class ConverterUI(tk.Tk):
                         + f"\n  Messages needing each element (of {messages}): "
                         + ", ".join(f"{name} {usage.get(name, 0)}" for name in cce.ELEMENTS))
                     self._set_busy(False, "Class C elements suggested. Adjust the checkboxes if needed.")
+                elif kind == "groups_done":
+                    self._set_busy(False, "Name the Class C element groups.")
+                    dialog = CustomElementsDialog(self, payload, self.custom_layout)
+                    self.wait_window(dialog)
+                    if dialog.result == "standard":
+                        self._set_custom_layout(None)
+                        self.status_var.set("Using the Class C element checkboxes.")
+                    elif dialog.result is not None:
+                        self._set_custom_layout(dialog.result)
+                        self.status_var.set("Custom Class C elements set.")
                 elif kind == "progress":
                     percent, status = payload
                     self._set_progress(int(percent), str(status))
@@ -630,6 +685,272 @@ class ConverterUI(tk.Tk):
         except queue.Empty:
             pass
         self.after(100, self._pump_events)
+
+
+class CustomElementsDialog(tk.Toplevel):
+    """Name Class C element groups (one role on one physical sign).
+
+    Rows sharing a name become one element.  ``result`` is a CustomLayout,
+    "standard" to return to the checkboxes, or None when cancelled.
+    """
+
+    def __init__(self, parent: tk.Tk, groups: list, current: cce.CustomLayout | None):
+        super().__init__(parent)
+        self.title("Custom Class C Elements")
+        self.configure(background="#0B1220")
+        self.geometry("1240x580")
+        self.minsize(820, 420)
+        # No transient(): on Windows it removes the maximize button.  grab_set() keeps it modal.
+        self.result = None
+        self.groups = {f"g{index}": group for index, group in enumerate(groups)}
+        self.names = {key: (current.name_for(group.role, group.sign) if current else group.role)
+                      for key, group in self.groups.items()}
+        # Output order of the elements (IPS listing columns); groups only set names.
+        self.element_order: list[str] = list(current.elements) if current else []
+
+        frame = tk.Frame(self, bg="#0B1220", padx=16, pady=14)
+        frame.pack(fill="both", expand=True)
+        frame.columnconfigure(0, weight=1)
+        frame.rowconfigure(1, weight=1)
+        intro = tk.Label(
+            frame, bg="#0B1220", fg="#CBD5E1", font=("Segoe UI", 9), justify="left", anchor="w",
+            text=("Each row is one role on one sign. Rows with the same element name become one element "
+                  "(merge); give a row its own name to split it out. Select rows, then type or pick a name. "
+                  f"Choose {cce.UNLINKED} to keep a row's text on the signs without linking it to any element."),
+        )
+        intro.grid(row=0, column=0, columnspan=3, sticky="ew", pady=(0, 10))
+        intro.bind("<Configure>", lambda event: intro.configure(wraplength=max(200, event.width - 10)))
+
+        style = ttk.Style(self)
+        style.configure("Custom.Treeview", background="#0F172A", fieldbackground="#0F172A",
+                        foreground="#E5E7EB", rowheight=22, bordercolor="#253047")
+        style.configure("Custom.Treeview.Heading", background="#172033", foreground="#F8FAFC",
+                        font=("Segoe UI", 9, "bold"))
+        # clam lightens hovered headings to near-white; keep them dark and readable.
+        style.map("Custom.Treeview.Heading", background=[("active", "#22304A"), ("pressed", "#1D4ED8")],
+                  foreground=[("active", "#F8FAFC")])
+        style.map("Custom.Treeview", background=[("selected", "#1D4ED8")])
+        columns = ("element", "role", "sign", "messages", "examples")
+        self.tree = ttk.Treeview(frame, columns=columns, show="headings", selectmode="extended",
+                                 style="Custom.Treeview")
+        self.headings = {}
+        self.sort_state = (None, False)
+        for column, title, width, stretch in (
+                ("element", "Element", 150, False), ("role", "Role", 120, False),
+                ("sign", "Sign", 260, False), ("messages", "Messages", 80, False),
+                ("examples", "Examples", 380, True)):
+            self.headings[column] = title
+            if column in ("element", "role", "sign"):
+                self.tree.heading(column, text=title, command=lambda c=column: self._sort(c))
+            else:
+                self.tree.heading(column, text=title)
+            self.tree.column(column, width=width, stretch=stretch, anchor="e" if column == "messages" else "w")
+        scroll = ttk.Scrollbar(frame, orient="vertical", command=self.tree.yview)
+        self.tree.configure(yscrollcommand=scroll.set)
+        self.tree.grid(row=1, column=0, sticky="nsew")
+        scroll.grid(row=1, column=1, sticky="ns")
+        for key, group in self.groups.items():
+            self.tree.insert("", "end", iid=key, values=(
+                self.names[key], group.role, group.label, group.messages, " | ".join(group.samples)))
+        self.tree.bind("<<TreeviewSelect>>", self._on_select)
+
+        order_panel = tk.Frame(frame, bg="#111827", highlightbackground="#253047", highlightthickness=1,
+                               padx=10, pady=8)
+        order_panel.grid(row=1, column=2, rowspan=2, sticky="ns", padx=(12, 0))
+        order_panel.rowconfigure(1, weight=1)
+        tk.Label(order_panel, text="Element Order", bg="#111827", fg="#F8FAFC",
+                 font=("Segoe UI", 9, "bold")).grid(row=0, column=0, columnspan=2, sticky="w")
+        self.order_list = tk.Listbox(
+            order_panel, width=22, activestyle="none", exportselection=False, bg="#0F172A", fg="#E5E7EB",
+            selectbackground="#1D4ED8", selectforeground="#FFFFFF", highlightthickness=1,
+            highlightbackground="#253047", relief="flat", font=("Segoe UI", 9))
+        self.order_list.grid(row=1, column=0, columnspan=2, sticky="nsew", pady=(6, 6))
+        self.order_list.bind("<Button-1>", self._drag_start)
+        self.order_list.bind("<B1-Motion>", self._drag_motion)
+        self.order_list.bind("<ButtonRelease-1>", lambda _event: setattr(self, "_drag_index", None))
+        self._drag_index = None
+        ttk.Button(order_panel, text="Move Up", style="Converter.TButton",
+                   command=lambda: self._move_element(-1)).grid(row=2, column=0, sticky="ew", padx=(0, 4))
+        ttk.Button(order_panel, text="Move Down", style="Converter.TButton",
+                   command=lambda: self._move_element(1)).grid(row=2, column=1, sticky="ew")
+        tk.Label(order_panel, text="Left-to-right column\norder in IPS", bg="#111827", fg="#94A3B8",
+                 font=("Segoe UI", 8), justify="left").grid(row=3, column=0, columnspan=2, sticky="w", pady=(6, 0))
+
+        edit = tk.Frame(frame, bg="#0B1220")
+        edit.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(10, 0))
+        tk.Label(edit, text="Element Name for Selected Rows", bg="#0B1220", fg="#CBD5E1",
+                 font=("Segoe UI", 9)).pack(side="left")
+        self.name_var = tk.StringVar()
+        self.name_box = ttk.Combobox(edit, textvariable=self.name_var, width=28, style="Converter.TCombobox")
+        self.name_box.pack(side="left", padx=8)
+        self.name_box.bind("<Return>", lambda _event: self._apply_name())
+        ttk.Button(edit, text="Apply", style="Converter.TButton", command=self._apply_name).pack(side="left")
+        ttk.Button(edit, text="Use Role Names", style="Converter.TButton",
+                   command=self._reset).pack(side="left", padx=(8, 0))
+        self._refresh_names()
+
+        buttons = tk.Frame(frame, bg="#0B1220")
+        buttons.grid(row=3, column=0, columnspan=3, sticky="ew", pady=(12, 0))
+        ttk.Button(buttons, text="Load Preset...", style="Converter.TButton", command=self._load).pack(side="left")
+        ttk.Button(buttons, text="Save Preset...", style="Converter.TButton",
+                   command=self._save).pack(side="left", padx=(8, 0))
+        ttk.Button(buttons, text="Use Checkboxes Instead", style="Converter.TButton",
+                   command=self._standard).pack(side="left", padx=(8, 0))
+        ttk.Button(buttons, text="Cancel", style="Converter.TButton", command=self.destroy).pack(side="right")
+        ttk.Button(buttons, text="OK", style="Primary.Converter.TButton",
+                   command=self._ok).pack(side="right", padx=(0, 8))
+        self.grab_set()
+
+    def _sort(self, column: str):
+        previous, descending = self.sort_state
+        descending = not descending if previous == column else False
+        self.sort_state = (column, descending)
+        original = {key: index for index, key in enumerate(self.groups)}
+
+        def key(item):
+            group = self.groups[item]
+            role_rank = cce.ELEMENTS.index(group.role)
+            if column == "element":
+                name = self.names[item]
+                primary = (name == cce.UNLINKED, name.lower())
+            elif column == "role":
+                primary = (role_rank,)
+            else:
+                primary = (group.label.lower(),)
+            # Ties keep the analysis order (role, then sign priority).
+            return primary + (original[item],)
+
+        for index, item in enumerate(sorted(self.groups, key=key, reverse=descending)):
+            self.tree.move(item, "", index)
+        for name, title in self.headings.items():
+            arrow = (" \u25bc" if descending else " \u25b2") if name == column else ""
+            self.tree.heading(name, text=title + arrow)
+
+    def _refresh_names(self):
+        names = [name for name in dict.fromkeys(self.names[key] for key in self.groups) if name != cce.UNLINKED]
+        self.name_box.configure(values=names + [cce.UNLINKED])
+        for key in self.groups:
+            self.tree.set(key, "element", self.names[key])
+        # Keep the chosen order; new names go last, unused names drop out.
+        self.element_order = [name for name in self.element_order if name in names]
+        self.element_order += [name for name in names if name not in self.element_order]
+        self._show_order()
+
+    def _show_order(self, selected: str | None = None):
+        if selected is None:
+            current = self.order_list.curselection()
+            selected = self.order_list.get(current[0]) if current else None
+        self.order_list.delete(0, "end")
+        for name in self.element_order:
+            self.order_list.insert("end", name)
+        if selected in self.element_order:
+            index = self.element_order.index(selected)
+            self.order_list.selection_set(index)
+            self.order_list.see(index)
+
+    def _drag_start(self, event):
+        index = self.order_list.nearest(event.y)
+        self._drag_index = index if 0 <= index < len(self.element_order) else None
+
+    def _drag_motion(self, event):
+        if self._drag_index is None:
+            return
+        target = self.order_list.nearest(event.y)
+        if target == self._drag_index or not 0 <= target < len(self.element_order):
+            return
+        name = self.element_order.pop(self._drag_index)
+        self.element_order.insert(target, name)
+        self._drag_index = target
+        self._show_order(name)
+
+    def _move_element(self, step: int):
+        current = self.order_list.curselection()
+        if not current:
+            return
+        index = current[0]
+        target = index + step
+        if not 0 <= target < len(self.element_order):
+            return
+        order = self.element_order
+        order[index], order[target] = order[target], order[index]
+        self._show_order(order[target])
+
+    def _on_select(self, _event=None):
+        selected = self.tree.selection()
+        names = {self.names[key] for key in selected}
+        if len(names) == 1:
+            self.name_var.set(names.pop())
+
+    def _apply_name(self):
+        name = self.name_var.get().strip()
+        selected = self.tree.selection()
+        if not selected:
+            messagebox.showinfo(APP_TITLE, "Select one or more rows first.", parent=self)
+            return
+        try:
+            if name != cce.UNLINKED:
+                cce.validate_element_names([name])
+        except ValueError as error:
+            messagebox.showerror(APP_TITLE, str(error), parent=self)
+            return
+        if name != cce.UNLINKED and name not in self.element_order:
+            # A new name takes the place of the earliest name it replaces.
+            positions = [self.element_order.index(self.names[key]) for key in selected
+                         if self.names[key] in self.element_order]
+            if positions:
+                self.element_order.insert(min(positions), name)
+        for key in selected:
+            self.names[key] = name
+        self._refresh_names()
+
+    def _reset(self):
+        for key, group in self.groups.items():
+            self.names[key] = group.role
+        self.element_order = []
+        self._refresh_names()
+
+    def _layout(self) -> cce.CustomLayout:
+        assignments = {(group.role, group.sign): self.names[key] for key, group in self.groups.items()}
+        return cce.CustomLayout.build(assignments, order=self.element_order)
+
+    def _load(self):
+        fn = filedialog.askopenfilename(parent=self, title="Load Class C Element Preset",
+                                        filetypes=[("Class C preset", "*.json"), ("All files", "*.*")])
+        if not fn:
+            return
+        try:
+            preset = cce.load_preset(fn)
+        except Exception as error:
+            messagebox.showerror(APP_TITLE, f"Could not load preset:\n{error}", parent=self)
+            return
+        for key, group in self.groups.items():
+            self.names[key] = preset.name_for(group.role, group.sign)
+        self.element_order = list(preset.elements)
+        self._refresh_names()
+
+    def _save(self):
+        try:
+            layout = self._layout()
+        except ValueError as error:
+            messagebox.showerror(APP_TITLE, str(error), parent=self)
+            return
+        fn = filedialog.asksaveasfilename(parent=self, title="Save Class C Element Preset",
+                                          defaultextension=".json", initialfile="class-c-elements.json",
+                                          filetypes=[("Class C preset", "*.json"), ("All files", "*.*")])
+        if fn:
+            cce.save_preset(layout, fn)
+
+    def _standard(self):
+        self.result = "standard"
+        self.destroy()
+
+    def _ok(self):
+        try:
+            self.result = self._layout()
+        except ValueError as error:
+            messagebox.showerror(APP_TITLE, str(error), parent=self)
+            return
+        self.destroy()
 
 
 if __name__ == "__main__":

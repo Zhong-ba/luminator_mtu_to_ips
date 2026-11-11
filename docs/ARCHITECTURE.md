@@ -24,11 +24,18 @@ normalized project model
 copy donor Jet database
         │
         ▼
+bind controller module (donor → local IPS databases → rebuilt from MTU)
+        │
+        ▼
 DAO inserts/remaps AutoNumbers
         │
         ▼
 recovered .ips + verification JSON
 ```
+
+## Controller module
+
+Every MTU begins with a verbatim copy of its controller module (`.lod`, ending at the master table). The compiler patches only bytes 4-9 (a 32-bit word count of the payload after byte 512, plus a 16-bit checksum) and 508-509 (packed-decimal output version); module identity is therefore compared with those bytes masked. When no stored module matches, the module is rebuilt from the MTU with the count/checksum cleared and the version kept. The checksum algorithm is not a plain word/byte sum or a common CRC-16; it has not been identified.
 
 ## Sign selectors
 
@@ -72,6 +79,8 @@ Signs are grouped by display geometry, which is stable across part families (08B
 5. **Folding**: unchosen elements resolve to their parent (`RouteSide`/`RouteRear` → `RouteFront` → `MainFront`; `MainSide`/`SecondaryFront` → `MainFront`).
 
 Suggestions check front elements whose content occurs, and side/rear elements only when those signs differ from the front in at least 2% of messages.
+
+Custom layouts (`CustomLayout`) reuse the same role decoding with all six roles, then name each item by its (role, sign key) group, where the sign key is `part@address`. Listing text for a custom element comes from the signs of its first role. Custom elements are numbered from ElementID 20 in their chosen output order, and that order also sets the IPS listing columns and the physical `ClassCMsgs` column order. Groups named `(unlinked)` keep their frames with ElementID 0 and are left out of listings. Blank frames take their sign's dominant destination element, falling back to route elements only when the sign shows nothing else. Presets store the per-group names plus a default per role for signs they do not list.
 
 Graphics use ElementID 0 and blank frames take their sign's dominant element. Listing text joins frames with `^` and in-frame lines with `÷`. The writer makes `ClassCMsgs` hold exactly the chosen element columns (zero-length strings allowed) and leaves `ClassMsgs` empty, as native IPS projects do.
 

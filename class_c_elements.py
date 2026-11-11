@@ -80,8 +80,22 @@ class ClassCLayout:
             element = FALLBACK[element]
         return element
 
+    # Layout interface shared with CustomLayout.
+    @property
+    def role_layout(self) -> "ClassCLayout":
+        return self
+
+    def name_for(self, role: str, sign_key: str) -> str:
+        return role
+
+    def primary_role(self, name: str) -> str:
+        return name
+
+    def element_id(self, name: str) -> int:
+        return ELEMENT_IDS[name]
+
     def element_rows(self) -> list[dict]:
-        return [{"ElementID": ELEMENT_IDS[name], "MsgClassID": 3, "ElementName": name,
+        return [{"ElementID": self.element_id(name), "MsgClassID": 3, "ElementName": name,
                  "ElementDescription": ELEMENT_DESCRIPTIONS[name]} for name in self.elements]
 
     def listing_columns(self) -> list[tuple[str, int]]:
@@ -90,6 +104,158 @@ class ClassCLayout:
 
     def describe(self) -> dict:
         return {"elements": list(self.elements)}
+
+
+CUSTOM_ELEMENT_FIRST_ID = 20   # above the IDs stock IPS projects use for any class
+_ELEMENT_NAME = re.compile(r"[A-Za-z][A-Za-z0-9_]{0,29}")
+_RESERVED_COLUMNS = {"msgcode", "msgclassid", "approved", "locked"}
+PRESET_FORMAT = "luminator-mtu-to-ips/class-c-preset"
+# Custom-layout choice for text kept on the signs but linked to no element
+# (ElementID 0), as IPS authors do for text edited directly on a sign.
+UNLINKED = "(unlinked)"
+
+
+def validate_element_names(names) -> None:
+    """Element names become ClassCMsgs columns (<name> and ID<name>)."""
+    seen = {}
+    for name in names:
+        if not _ELEMENT_NAME.fullmatch(name or ""):
+            raise ValueError(f"Invalid element name {name!r}: use 1-30 letters, digits or _, "
+                             "starting with a letter")
+        if name.lower() in _RESERVED_COLUMNS:
+            raise ValueError(f"Element name {name!r} is reserved by IPS")
+        if name.lower() in seen:
+            raise ValueError(f"Element names {seen[name.lower()]!r} and {name!r} differ only by case")
+        seen[name.lower()] = name
+    for name in names:
+        if ("id" + name).lower() in seen:
+            raise ValueError(f"Element {seen[('id' + name).lower()]!r} clashes with the ID column of {name!r}")
+
+
+@dataclass(frozen=True)
+class CustomLayout:
+    """User-named elements, assigned per (role, physical sign) group.
+
+    ``assignments`` maps (role, sign key) to an element name; groups not listed
+    use ``role_defaults`` so a preset also applies to MTUs with other signs.
+    Giving several groups one name merges them into a single element.
+    """
+    assignments: tuple[tuple[str, str, str], ...]
+    role_defaults: tuple[tuple[str, str], ...]
+    order: tuple[str, ...] = ()
+
+    def __post_init__(self):
+        defaults = dict(self.role_defaults)
+        missing = [role for role in ELEMENTS if role not in defaults]
+        if missing:
+            raise ValueError("Custom layout needs a default element for " + ", ".join(missing))
+        bad_roles = {role for role, _, _ in self.assignments} - set(ELEMENTS)
+        if bad_roles:
+            raise ValueError("Unknown role(s): " + ", ".join(sorted(bad_roles)))
+        used = list(dict.fromkeys(
+            [name for _, _, name in self.assignments] + [defaults[role] for role in ELEMENTS]))
+        used = [name for name in used if name != UNLINKED]
+        if not used:
+            raise ValueError("Keep at least one element; every group is unlinked")
+        order = [name for name in dict.fromkeys(self.order) if name in used]
+        # Unordered names follow their first role in ELEMENTS order.
+        order += sorted((name for name in used if name not in order),
+                        key=lambda name: ELEMENTS.index(self._first_role(name)))
+        validate_element_names(order)
+        object.__setattr__(self, "order", tuple(order))
+        object.__setattr__(self, "_lookup", {(role, sign): name for role, sign, name in self.assignments})
+        object.__setattr__(self, "_defaults", defaults)
+
+    @classmethod
+    def build(cls, assignments: dict[tuple[str, str], str], order=None) -> "CustomLayout":
+        """Create a layout from per-group names.
+
+        A role's default (used for signs not in ``assignments``) is its most
+        common chosen name; roles with no groups fold into their parent role's
+        default so they do not add empty elements.
+        """
+        chosen = {}
+        for role in ELEMENTS:
+            names = Counter(name for (group_role, _), name in assignments.items() if group_role == role)
+            if names:
+                chosen[role] = names.most_common(1)[0][0]
+        defaults = {}
+        for role in ELEMENTS:
+            parent = role
+            while parent not in chosen and parent in FALLBACK:
+                parent = FALLBACK[parent]
+            defaults[role] = chosen.get(parent, parent)
+        return cls(tuple((role, sign, name) for (role, sign), name in sorted(assignments.items())),
+                   tuple(defaults.items()), tuple(order or ()))
+
+    def _first_role(self, name: str) -> str:
+        roles = [role for role, _, n in self.assignments if n == name]
+        roles += [role for role, n in self.role_defaults if n == name]
+        return min(roles, key=ELEMENTS.index) if roles else "MainFront"
+
+    @property
+    def elements(self) -> tuple[str, ...]:
+        return self.order
+
+    @property
+    def role_layout(self) -> ClassCLayout:
+        return ClassCLayout(ELEMENTS)
+
+    def name_for(self, role: str, sign_key: str) -> str:
+        return self._lookup.get((role, sign_key), self._defaults[role])
+
+    def primary_role(self, name: str) -> str:
+        return self._first_role(name)
+
+    def element_id(self, name: str) -> int:
+        # Numbered in output order so every IPS view of the elements agrees with it.
+        return CUSTOM_ELEMENT_FIRST_ID + self.order.index(name)
+
+    def element_rows(self) -> list[dict]:
+        rows = []
+        for name in self.order:
+            role = self.primary_role(name)
+            description = (ELEMENT_DESCRIPTIONS[name] if name in ELEMENT_DESCRIPTIONS
+                           else f"Custom ({ELEMENT_DESCRIPTIONS[role].lower()})")
+            rows.append({"ElementID": self.element_id(name), "MsgClassID": 3, "ElementName": name,
+                         "ElementDescription": description})
+        return rows
+
+    def listing_columns(self) -> list[tuple[str, int]]:
+        return ([("MsgCode", 900), ("Locked", 700)]
+                + [(name, ELEMENT_COLUMN_WIDTHS[self.primary_role(name)]) for name in self.order])
+
+    def describe(self) -> dict:
+        return {"elements": list(self.order), "custom": True}
+
+    def to_preset(self) -> dict:
+        return {
+            "format": PRESET_FORMAT, "version": 1,
+            "elements": list(self.order),
+            "role_defaults": dict(self.role_defaults),
+            "assignments": [{"role": role, "sign": sign, "element": name}
+                            for role, sign, name in self.assignments],
+        }
+
+    @classmethod
+    def from_preset(cls, data: dict) -> "CustomLayout":
+        if data.get("format") != PRESET_FORMAT:
+            raise ValueError("Not a Class C element preset")
+        return cls(tuple((a["role"], a["sign"], a["element"]) for a in data.get("assignments", [])),
+                   tuple(dict(data.get("role_defaults", {})).items()),
+                   tuple(data.get("elements", ())))
+
+
+def save_preset(layout: CustomLayout, path) -> None:
+    import json
+    from pathlib import Path
+    Path(path).write_text(json.dumps(layout.to_preset(), indent=2), encoding="utf-8")
+
+
+def load_preset(path) -> CustomLayout:
+    import json
+    from pathlib import Path
+    return CustomLayout.from_preset(json.loads(Path(path).read_text(encoding="utf-8")))
 
 
 @dataclass
@@ -137,16 +303,17 @@ def sign_groups(sign_tables: dict | None) -> SignGroups:
 
 @dataclass
 class ClassCDecoding:
-    layout: ClassCLayout
-    element_of: dict[int, str | None]          # frame ordinal -> element name (None: graphic)
+    layout: "ClassCLayout | CustomLayout"
+    element_of: dict[int, str | None]          # frame ordinal -> element name (None: graphic or unlinked)
     listings: dict[int, dict[str, str]]        # MsgCode -> element name -> listing text
     usage: Counter = field(default_factory=Counter)  # element -> number of messages using it
     # side/rear element -> messages where those signs differ from the front
     needed: Counter = field(default_factory=Counter)
+    role_of: dict[int, str] = field(default_factory=dict)  # frame ordinal -> role before naming
 
     def element_id(self, ordinal: int) -> int:
         name = self.element_of.get(ordinal)
-        return ELEMENT_IDS[name] if name else 0
+        return self.layout.element_id(name) if name else 0
 
 
 @dataclass
@@ -261,8 +428,10 @@ def _assign_lines(items: list[_Item]) -> None:
         it.slot = "secondary" if lower and it.font not in top_fonts else "main"
 
 
-def _decode_message(rows, groups: SignGroups, layout: ClassCLayout, element_of: dict,
-                    needed: Counter) -> dict[str, str]:
+def _decode_message(rows, groups: SignGroups, layout, sign_keys: dict[int, str], element_of: dict,
+                    role_of: dict, needed: Counter) -> dict[str, str]:
+    """Assign roles with ``layout.role_layout``, then name them through ``layout``."""
+    roles = layout.role_layout
     signs: dict[int, dict[int, list[_Item]]] = defaultdict(lambda: defaultdict(list))
     frames_of: dict[int, set[int]] = defaultdict(set)
     graphic_frames: set[tuple[int, int]] = set()
@@ -315,7 +484,7 @@ def _decode_message(rows, groups: SignGroups, layout: ClassCLayout, element_of: 
             it.slot = match
     front_slot_element = {"route": "RouteFront", "main": "MainFront", "secondary": "SecondaryFront"}
     for it in items_of(front_lids):
-        it.element = layout.resolve(front_slot_element[it.slot])
+        it.element = roles.resolve(front_slot_element[it.slot])
 
     # 3. Side signs fill the chosen side elements.  An unchosen one falls back to
     # the front element showing the same text, then to its parent element.
@@ -328,10 +497,10 @@ def _decode_message(rows, groups: SignGroups, layout: ClassCLayout, element_of: 
             needed.update(["MainSide"] + (["RouteSide"] if any(it.slot == "route" for it in sign_items) else []))
         for it in sign_items:
             target = "RouteSide" if it.slot == "route" else "MainSide"
-            if target in layout.elements:
+            if target in roles.elements:
                 it.element = target
             else:
-                it.element = front_norms.get(it.norm) or layout.resolve(target)
+                it.element = front_norms.get(it.norm) or roles.resolve(target)
 
     # 4. Rear displays fill RouteRear when chosen; otherwise they share the front
     # route they repeat.
@@ -339,25 +508,37 @@ def _decode_message(rows, groups: SignGroups, layout: ClassCLayout, element_of: 
     for it in items_of(rear_lids):
         if it.norm not in front_routes:
             needed["RouteRear"] += 1
-        if "RouteRear" in layout.elements:
+        if "RouteRear" in roles.elements:
             choice = "RouteRear"
-        elif not front_routes and "SecondaryFront" in layout.elements:
+        elif not front_routes and "SecondaryFront" in roles.elements:
             # A rear message that is not a route number is the short destination.
             choice = "SecondaryFront"
         else:
             choice = "RouteFront"
-        it.element = layout.resolve(choice)
+        it.element = roles.resolve(choice)
 
-    # 5. Element per frame row; blank frames follow their sign's dominant element.
+    # Name each role through the layout (custom layouts split, merge or unlink
+    # roles per sign; unlinked text stays on the sign with ElementID 0).
+    for it in items_of(list(signs)):
+        role_of[it.ordinal] = it.element
+        name = layout.name_for(it.element, sign_keys.get(it.lid, ""))
+        it.element = None if name == UNLINKED else name
+
+    # 5. Element per frame row; blank frames follow their sign's dominant
+    # destination element (route elements only when the sign has nothing else).
     per_sign = defaultdict(Counter)
+    per_sign_routes = defaultdict(Counter)
     for lid, frames in signs.items():
         for items in frames.values():
             for it in items:
                 element_of[it.ordinal] = it.element
-                per_sign[lid][it.element] += 1
+                if it.element is not None:
+                    target = per_sign_routes if role_of[it.ordinal] in ROUTE_ELEMENTS else per_sign
+                    target[lid][it.element] += 1
     for ordinal, lid in blanks:
-        common = per_sign[lid].most_common(1)
-        element_of[ordinal] = common[0][0] if common else layout.resolve("MainFront")
+        common = per_sign[lid].most_common(1) or per_sign_routes[lid].most_common(1)
+        fallback = layout.name_for(roles.resolve("MainFront"), sign_keys.get(lid, ""))
+        element_of[ordinal] = common[0][0] if common else (None if fallback == UNLINKED else fallback)
 
     # 6. Listing text, from the sign that best represents each element, so each
     # listing reflects the frames tagged with that element.
@@ -369,9 +550,10 @@ def _decode_message(rows, groups: SignGroups, layout: ClassCLayout, element_of: 
     for it in items_of(list(signs)):
         spelled.setdefault(it.norm, it.text)
     for name in layout.elements:
-        if name in SIDE_ELEMENTS:
+        role = layout.primary_role(name)
+        if role in SIDE_ELEMENTS:
             order = groups.side + groups.front
-        elif name == "RouteRear":
+        elif role == "RouteRear":
             order = rear_source + groups.front + groups.side
         else:
             order = groups.front + groups.side + rear_source
@@ -428,7 +610,8 @@ def _listing_text(frames: dict[int, list[_Item]], frame_numbers: set[int], eleme
     return FRAME_SEPARATOR.join(values)
 
 
-def decode_class_c(frames: list[dict], sign_tables: dict | None, layout: ClassCLayout) -> ClassCDecoding:
+def decode_class_c(frames: list[dict], sign_tables: dict | None,
+                   layout: "ClassCLayout | CustomLayout") -> ClassCDecoding:
     """Assign an element to every Class C frame row and rebuild listing text."""
     groups = sign_groups(sign_tables)
     by_code = defaultdict(list)
@@ -436,15 +619,68 @@ def decode_class_c(frames: list[dict], sign_tables: dict | None, layout: ClassCL
         if int(row.get("MsgClassID", 0)) == 3:
             by_code[int(row["MsgCode"])].append((ordinal, row))
     element_of: dict[int, str | None] = {}
+    role_of: dict[int, str] = {}
     listings: dict[int, dict[str, str]] = {}
     usage: Counter = Counter()
     needed: Counter = Counter()
+    keys = sign_keys(sign_tables)
     for code, rows in sorted(by_code.items()):
         message_needs: Counter = Counter()
-        listings[code] = _decode_message(rows, groups, layout, element_of, message_needs)
+        listings[code] = _decode_message(rows, groups, layout, keys, element_of, role_of, message_needs)
         usage.update({element_of[o] for o, _ in rows if element_of.get(o)})
         needed.update(set(message_needs))
-    return ClassCDecoding(layout, element_of, listings, usage, needed)
+    return ClassCDecoding(layout, element_of, listings, usage, needed, role_of)
+
+
+def sign_keys(sign_tables: dict | None) -> dict[int, str]:
+    """Stable per-fleet sign identity (part number @ peripheral address)."""
+    phys = {int(p["PSignID"]): p for p in (sign_tables or {}).get("PhysicalSigns", [])}
+    return {int(link["LSignID"]): "{}@{}".format(
+                str(phys.get(int(link["PSignID"]), {}).get("PSignPartNumber") or "?").upper(),
+                link.get("PSignAddr"))
+            for link in (sign_tables or {}).get("LogicalSignBuild", [])}
+
+
+@dataclass
+class ElementGroup:
+    """One role on one physical sign: the unit a custom layout names."""
+    role: str
+    sign: str          # sign key, e.g. 08B1@2
+    label: str         # human description of the sign
+    kind: str          # front / side / rear / ODK
+    messages: int
+    rows: int
+    samples: list[str]
+
+
+def analyze_groups(frames: list[dict], sign_tables: dict | None, sample_count: int = 4) -> list[ElementGroup]:
+    """Group Class C text by role and sign for naming custom elements."""
+    decoding = decode_class_c(frames, sign_tables, ClassCLayout(ELEMENTS))
+    groups = sign_groups(sign_tables)
+    keys = sign_keys(sign_tables)
+    phys = {int(p["PSignID"]): p for p in (sign_tables or {}).get("PhysicalSigns", [])}
+    info = {}
+    for link in (sign_tables or {}).get("LogicalSignBuild", []):
+        p = phys.get(int(link["PSignID"]), {})
+        lid = int(link["LSignID"])
+        kind = ("rear" if lid in groups.rear else "side" if lid in groups.side
+                else "ODK" if str(p.get("PSignType") or "").lower() == "char" else "front")
+        size = f"{p.get('LogicalDotWidth') or p.get('PSignDotWidth')}x{p.get('LogicalDotHeight') or p.get('PSignDotHeight')}"
+        info[lid] = (kind, f"{p.get('PSignName') or p.get('PSignPartNumber') or 'sign'} {size} {kind} @ {link.get('PSignAddr')}")
+    order = {lid: index for index, lid in enumerate(groups.front + groups.side + groups.rear)}
+    stats = defaultdict(lambda: {"messages": set(), "rows": 0, "texts": Counter()})
+    for ordinal, role in decoding.role_of.items():
+        row = frames[ordinal]
+        stat = stats[(role, int(row["LSignID"]))]
+        stat["messages"].add(int(row["MsgCode"]))
+        stat["rows"] += 1
+        stat["texts"][str(row.get("Phrase") or "")] += 1
+    result = []
+    for (role, lid), stat in sorted(stats.items(), key=lambda kv: (ELEMENTS.index(kv[0][0]), order.get(kv[0][1], 999))):
+        kind, label = info.get(lid, ("front", f"sign {lid}"))
+        result.append(ElementGroup(role, keys.get(lid, str(lid)), label, kind, len(stat["messages"]),
+                                   stat["rows"], [text for text, _ in stat["texts"].most_common(sample_count)]))
+    return result
 
 
 def suggest_layout(frames: list[dict], sign_tables: dict | None) -> ClassCLayout:
