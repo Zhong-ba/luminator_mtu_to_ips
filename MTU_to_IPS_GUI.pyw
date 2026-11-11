@@ -20,6 +20,7 @@ sys.path.insert(0, str(HERE))
 
 import build_ips_windows as builder
 import class_c_elements as cce
+import xlsx_export
 
 APP_TITLE = "Luminator MTU to IPS Converter"
 SETTINGS_DIR = Path(os.environ.get("APPDATA", Path.home())) / "LuminatorMTUtoIPS"
@@ -222,17 +223,19 @@ class ConverterUI(tk.Tk):
             pady=14,
         )
         actions.grid(row=2, column=0, columnspan=3, sticky="ew", pady=(14, 14))
-        actions.columnconfigure(3, weight=1)
+        actions.columnconfigure(4, weight=1)
         self.preflight_btn = ttk.Button(actions, text="Preflight", style="Converter.TButton", command=self._preflight)
         self.preflight_btn.grid(row=0, column=0, padx=(0, 8))
+        self.preview_btn = ttk.Button(actions, text="Preview Messages", style="Converter.TButton", command=self._preview_messages)
+        self.preview_btn.grid(row=0, column=1, padx=(0, 8))
         self.convert_btn = ttk.Button(actions, text="Convert MTU to IPS", style="Primary.Converter.TButton", command=self._convert)
-        self.convert_btn.grid(row=0, column=1, padx=(0, 8))
+        self.convert_btn.grid(row=0, column=2, padx=(0, 8))
         ttk.Checkbutton(
             actions,
             text="Open Output Folder When Finished",
             variable=self.open_folder_var,
             style="Converter.TCheckbutton",
-        ).grid(row=0, column=2, sticky="w")
+        ).grid(row=0, column=3, sticky="w")
 
         self.best_effort_check = ttk.Checkbutton(
             actions,
@@ -240,7 +243,7 @@ class ConverterUI(tk.Tk):
             variable=self.best_effort_var,
             style="Converter.TCheckbutton",
         )
-        self.best_effort_check.grid(row=1, column=0, columnspan=3, sticky="w", pady=(10, 0))
+        self.best_effort_check.grid(row=1, column=0, columnspan=4, sticky="w", pady=(10, 0))
 
         activity = tk.Frame(
             root,
@@ -363,6 +366,7 @@ class ConverterUI(tk.Tk):
     def _set_busy(self, busy: bool, status: str = ""):
         state = "disabled" if busy else "normal"
         self.preflight_btn.configure(state=state)
+        self.preview_btn.configure(state=state)
         self.convert_btn.configure(state=state)
         self.suggest_btn.configure(state=state)
         self.custom_btn.configure(state=state)
@@ -461,6 +465,35 @@ class ConverterUI(tk.Tk):
                 self.events.put(("error", traceback.format_exc()))
 
         self._start_worker(work, "Suggesting Class C elements...")
+
+    def _preview_messages(self):
+        mtu_text = self.mtu_var.get().strip()
+        if not mtu_text or not Path(mtu_text).is_file():
+            messagebox.showerror(APP_TITLE, "Choose a valid .mtu input file first.")
+            return
+        mtu = Path(mtu_text)
+        try:
+            layout = self._class_c_layout()
+        except ValueError as error:
+            messagebox.showerror(APP_TITLE, str(error))
+            return
+        best_effort = self.best_effort_var.get()
+
+        def work():
+            try:
+                self.events.put(("progress", (20, "Building the message lists...")))
+                model = builder.build_model(mtu, layout, best_effort=best_effort)
+                classes = builder.class_message_rows(model)
+                # Columns IPS lists for each class; Class A/B follow the donor's
+                # listing (its ClassBMsgs table holds PRText only).
+                tables = [("Class A", ["Title", "Text"], classes["ClassAMsgs"]),
+                          ("Class B", ["PRText"], classes["ClassBMsgs"]),
+                          ("Class C", list(layout.elements), classes["ClassCMsgs"])]
+                self.events.put(("preview_done", (mtu, tables)))
+            except Exception:
+                self.events.put(("error", traceback.format_exc()))
+
+        self._start_worker(work, "Building the message lists...")
 
     def _start_worker(self, target, status):
         if self.worker and self.worker.is_alive():
@@ -571,6 +604,12 @@ class ConverterUI(tk.Tk):
                         + ", ".join(f"{name} {usage.get(name, 0)}" for name in cce.ELEMENTS))
                     self._set_busy(False)
                     self._set_progress(100, "Class C elements suggested. Adjust the checkboxes if needed.")
+                elif kind == "preview_done":
+                    mtu, tables = payload
+                    self._set_busy(False)
+                    self._set_progress(100, "Message lists: " + ", ".join(
+                        f"{name} {len(rows)}" for name, _, rows in tables) + ".")
+                    MessagePreviewDialog(self, mtu, tables)
                 elif kind == "groups_done":
                     self._set_busy(False)
                     self._set_progress(100, "Name the Class C element groups.")
@@ -953,6 +992,137 @@ class CustomElementsDialog(tk.Toplevel):
             messagebox.showerror(APP_TITLE, str(error), parent=self)
             return
         self.destroy()
+
+
+class MessageTable(tk.Frame):
+    """Searchable, sortable list of one message class."""
+
+    def __init__(self, parent, columns: list[str], rows: list[dict]):
+        super().__init__(parent, bg="#0B1220", padx=10, pady=10)
+        self.columns = ["MsgCode"] + list(columns)
+        self.rows = [[int(row["MsgCode"])] + [str(row.get(name) or "") for name in columns] for row in rows]
+        self.sort_state = (0, False)
+        self.columnconfigure(0, weight=1)
+        self.rowconfigure(1, weight=1)
+
+        top = tk.Frame(self, bg="#0B1220")
+        top.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 8))
+        tk.Label(top, text="Search", bg="#0B1220", fg="#CBD5E1", font=("Segoe UI", 9)).pack(side="left")
+        self.search_var = tk.StringVar()
+        self.search = ttk.Entry(top, textvariable=self.search_var, width=36, style="Converter.TEntry")
+        self.search.pack(side="left", padx=8)
+        self.search_var.trace_add("write", lambda *_args: self._populate())
+        self.count_var = tk.StringVar()
+        tk.Label(top, textvariable=self.count_var, bg="#0B1220", fg="#94A3B8",
+                 font=("Segoe UI", 9)).pack(side="left", padx=(8, 0))
+        tk.Label(top, text="^ separates frames, \u00f7 separates lines", bg="#0B1220", fg="#94A3B8",
+                 font=("Segoe UI", 8)).pack(side="right")
+
+        ids = [f"c{index}" for index in range(len(self.columns))]
+        self.tree = ttk.Treeview(self, columns=ids, show="headings", selectmode="extended", style="Custom.Treeview")
+        for index, (column_id, name) in enumerate(zip(ids, self.columns)):
+            self.tree.heading(column_id, text=name, command=lambda i=index: self._sort(i))
+            self.tree.column(column_id, width=90 if index == 0 else 240, stretch=index > 0,
+                             anchor="e" if index == 0 else "w")
+        yscroll = ttk.Scrollbar(self, orient="vertical", command=self.tree.yview)
+        xscroll = ttk.Scrollbar(self, orient="horizontal", command=self.tree.xview)
+        self.tree.configure(yscrollcommand=yscroll.set, xscrollcommand=xscroll.set)
+        self.tree.grid(row=1, column=0, sticky="nsew")
+        yscroll.grid(row=1, column=1, sticky="ns")
+        xscroll.grid(row=2, column=0, sticky="ew")
+        self._populate()
+
+    def visible_rows(self) -> list[list]:
+        needle = self.search_var.get().strip().lower()
+        rows = [row for row in self.rows if not needle or any(needle in str(value).lower() for value in row)]
+        index, descending = self.sort_state
+        key = (lambda row: row[0]) if index == 0 else (lambda row: (row[index].lower(), row[0]))
+        return sorted(rows, key=key, reverse=descending)
+
+    def is_filtered(self) -> bool:
+        return bool(self.search_var.get().strip())
+
+    def _populate(self):
+        self.tree.delete(*self.tree.get_children())
+        rows = self.visible_rows()
+        for row in rows:
+            self.tree.insert("", "end", values=row)
+        total = len(self.rows)
+        self.count_var.set(f"{len(rows)} of {total} messages" if len(rows) != total else f"{total} messages")
+
+    def _sort(self, index: int):
+        previous, descending = self.sort_state
+        self.sort_state = (index, not descending if previous == index else False)
+        for column, name in enumerate(self.columns):
+            arrow = (" \u25bc" if self.sort_state[1] else " \u25b2") if column == index else ""
+            self.tree.heading(f"c{column}", text=name + arrow)
+        self._populate()
+
+
+class MessagePreviewDialog(tk.Toplevel):
+    """Class A, B and C message lists as IPS will show them, with Excel export."""
+
+    def __init__(self, parent: tk.Tk, mtu: Path, tables: list[tuple[str, list[str], list[dict]]]):
+        super().__init__(parent)
+        self.title(f"Message Lists - {mtu.name}")
+        self.configure(background="#0B1220")
+        self.geometry("1180x640")
+        self.minsize(720, 400)
+        self.mtu = mtu
+
+        style = ttk.Style(self)
+        style.configure("Custom.Treeview", background="#0F172A", fieldbackground="#0F172A",
+                        foreground="#E5E7EB", rowheight=22, bordercolor="#253047")
+        style.configure("Custom.Treeview.Heading", background="#172033", foreground="#F8FAFC",
+                        font=("Segoe UI", 9, "bold"))
+        style.map("Custom.Treeview.Heading", background=[("active", "#22304A"), ("pressed", "#1D4ED8")],
+                  foreground=[("active", "#F8FAFC")])
+        style.map("Custom.Treeview", background=[("selected", "#1D4ED8")])
+        style.configure("Preview.TNotebook", background="#0B1220", borderwidth=0)
+        style.configure("Preview.TNotebook.Tab", background="#172033", foreground="#CBD5E1",
+                        padding=(14, 6), font=("Segoe UI", 9, "bold"))
+        style.map("Preview.TNotebook.Tab", background=[("selected", "#1D4ED8"), ("active", "#22304A")],
+                  foreground=[("selected", "#FFFFFF")])
+
+        frame = tk.Frame(self, bg="#0B1220", padx=16, pady=14)
+        frame.pack(fill="both", expand=True)
+        frame.columnconfigure(0, weight=1)
+        frame.rowconfigure(0, weight=1)
+        self.notebook = ttk.Notebook(frame, style="Preview.TNotebook")
+        self.notebook.grid(row=0, column=0, sticky="nsew")
+        self.tables: list[tuple[str, MessageTable]] = []
+        for name, columns, rows in tables:
+            table = MessageTable(self.notebook, columns, rows)
+            self.notebook.add(table, text=f"{name} ({len(rows)})")
+            self.tables.append((name, table))
+        # Open on Class C, the list most users check.
+        self.notebook.select(len(self.tables) - 1)
+
+        buttons = tk.Frame(frame, bg="#0B1220")
+        buttons.grid(row=1, column=0, sticky="ew", pady=(12, 0))
+        ttk.Button(buttons, text="Export to Excel...", style="Primary.Converter.TButton",
+                   command=self._export).pack(side="left")
+        tk.Label(buttons, text="One sheet per class; each sheet uses its tab's search and sort.",
+                 bg="#0B1220", fg="#94A3B8", font=("Segoe UI", 8)).pack(side="left", padx=(10, 0))
+        ttk.Button(buttons, text="Close", style="Converter.TButton", command=self.destroy).pack(side="right")
+
+    def _export(self):
+        fn = filedialog.asksaveasfilename(
+            parent=self, title="Export Message Lists", defaultextension=".xlsx",
+            initialfile=f"{self.mtu.stem} - Messages.xlsx",
+            filetypes=[("Excel workbook", "*.xlsx"), ("All files", "*.*")])
+        if not fn:
+            return
+        sheets = [(name, table.columns, table.visible_rows()) for name, table in self.tables]
+        try:
+            xlsx_export.write_xlsx_sheets(fn, sheets)
+        except Exception as error:
+            messagebox.showerror(APP_TITLE, f"Could not export:\n{error}", parent=self)
+            return
+        summary = "\n".join(
+            f"{name}: {len(rows)} messages" + (" (search filter applied)" if table.is_filtered() else "")
+            for (name, _, rows), (_, table) in zip(sheets, self.tables))
+        messagebox.showinfo(APP_TITLE, f"Exported to:\n{fn}\n\n{summary}", parent=self)
 
 
 if __name__ == "__main__":

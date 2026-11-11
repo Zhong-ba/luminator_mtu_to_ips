@@ -81,6 +81,8 @@ A checked side or rear element is always filled from its signs, even when they s
 
 Listing text follows IPS conventions: `^` separates frames and `÷` separates lines within a frame. Compiled `MessageFrames` remain authoritative; the element choice only affects how messages are organized for editing in IPS.
 
+**Preview Messages** shows the Class A, B and C message lists as IPS will show them, without writing a project. Class C uses the current element checkboxes or custom elements. Each class has its own tab that can be searched and sorted by any column, and **Export to Excel...** saves one sheet per class with each tab's search filter and sort order applied.
+
 ### Custom elements
 
 **Custom...** groups the MTU's Class C text by role and physical sign (for example `MainFront` on the 200x24 front at address 12) and lets you name each group. Rows with the same name become one element, so you can merge groups (all route numbers as `Route`) or split them (`TitanText` for the Titan front only). Names may use letters, digits and `_` (up to 30 characters, starting with a letter). Choose `(unlinked)` to keep a group's text on the signs but link it to no element (ElementID 0), so it is edited directly on the sign rather than through the message list — the text itself is never removed.

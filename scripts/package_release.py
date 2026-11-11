@@ -25,6 +25,7 @@ REQUIRED_SOURCES = (
     ROOT / "class_c_elements.py",
     ROOT / "mtu_reverse.py",
     ROOT / "version.py",
+    ROOT / "xlsx_export.py",
     ROOT / "PROBE_DAO.vbs",
 )
 
